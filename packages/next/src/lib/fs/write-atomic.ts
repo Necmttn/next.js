@@ -1,17 +1,17 @@
-import { unlink, writeFile } from 'fs/promises'
-import { rename } from './rename'
+import { unlinkSync, writeFileSync } from 'fs'
+import { renameSync } from './rename'
 
-export async function writeFileAtomic(
+export function writeFileAtomic(
   filePath: string,
-  content: string
-): Promise<void> {
+  content: string | Buffer
+): void {
   const tempPath = filePath + '.tmp.' + Math.random().toString(36).slice(2)
   try {
-    await writeFile(tempPath, content, 'utf-8')
-    await rename(tempPath, filePath)
+    writeFileSync(tempPath, content, 'utf-8')
+    renameSync(tempPath, filePath)
   } catch (e) {
     try {
-      await unlink(tempPath)
+      unlinkSync(tempPath)
     } catch {
       // ignore
     }

@@ -58,12 +58,7 @@ type Cookies = {
  * @returns any injected metadata on the request
  */
 export function getRequestMeta(
-  headersOrCookies:
-    | Headers
-    | Cookies
-    | ReadonlyHeaders
-    | ReadonlyRequestCookies
-    | import('next/dist/compiled/node-fetch').Headers
+  headersOrCookies: Headers | Cookies | ReadonlyHeaders | ReadonlyRequestCookies
 ): Record<string, any> {
   const headerOrCookie = headersOrCookies.get(KEY)
   if (!headerOrCookie) return {}

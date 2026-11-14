@@ -2,7 +2,6 @@ import { bold, cyan, red } from '../picocolors'
 
 import { getOxfordCommaList } from '../oxford-comma-list'
 import type { MissingDependency } from '../has-necessary-dependencies'
-import { FatalError } from '../fatal-error'
 import { getPkgManager } from '../helpers/get-pkg-manager'
 
 export function missingDepsError(
@@ -10,7 +9,7 @@ export function missingDepsError(
   missingPackages: MissingDependency[]
 ): never {
   const packagesHuman = getOxfordCommaList(missingPackages.map((p) => p.pkg))
-  const packagesCli = missingPackages.map((p) => p.pkg).join(' ')
+  const packagesCli = missingPackages.map((p) => p.install ?? p.pkg).join(' ')
   const packageManager = getPkgManager(dir)
 
   const removalMsg =
@@ -18,10 +17,10 @@ export function missingDepsError(
     bold(
       'If you are not trying to use TypeScript, please remove the ' +
         cyan('tsconfig.json') +
-        ' file from your package root (and any TypeScript files in your pages directory).'
+        ' file from your package root (and any TypeScript files in your app and pages directories).'
     )
 
-  throw new FatalError(
+  throw new Error(
     bold(
       red(
         `It looks like you're trying to use TypeScript but do not have the required package(s) installed.`
@@ -35,8 +34,8 @@ export function missingDepsError(
           (packageManager === 'yarn'
             ? 'yarn add --dev'
             : packageManager === 'pnpm'
-            ? 'pnpm install --save-dev'
-            : 'npm install --save-dev') +
+              ? 'pnpm install --save-dev'
+              : 'npm install --save-dev') +
             ' ' +
             packagesCli
         )

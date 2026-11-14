@@ -1,8 +1,9 @@
-import React from 'react'
 import { interopDefault } from './interop-default'
 import { getLinkAndScriptTags } from './get-css-inlined-link-tags'
 import type { AppRenderContext } from './app-render'
 import { getAssetQueryString } from './get-asset-query-string'
+import { encodeURIPath } from '../../shared/lib/encode-uri-path'
+import { renderCssResource } from './render-css-resource'
 
 export async function createComponentStylesAndScripts({
   filePath,
@@ -17,49 +18,32 @@ export async function createComponentStylesAndScripts({
   injectedJS: Set<string>
   ctx: AppRenderContext
 }): Promise<[React.ComponentType<any>, React.ReactNode, React.ReactNode]> {
-  const { styles: cssHrefs, scripts: jsHrefs } = getLinkAndScriptTags(
-    ctx.clientReferenceManifest,
+  const {
+    componentMod: { createElement },
+  } = ctx
+  const { styles: entryCssFiles, scripts: jsHrefs } = getLinkAndScriptTags(
     filePath,
     injectedCSS,
     injectedJS
   )
 
-  const styles = cssHrefs
-    ? cssHrefs.map((href, index) => {
-        const fullHref = `${ctx.assetPrefix}/_next/${href}${getAssetQueryString(
-          ctx,
-          true
-        )}`
+  const styles = renderCssResource(entryCssFiles, ctx)
 
-        // `Precedence` is an opt-in signal for React to handle resource
-        // loading and deduplication, etc. It's also used as the key to sort
-        // resources so they will be injected in the correct order.
-        // During HMR, it's critical to use different `precedence` values
-        // for different stylesheets, so their order will be kept.
-        // https://github.com/facebook/react/pull/25060
-        const precedence =
-          process.env.NODE_ENV === 'development' ? 'next_' + href : 'next'
-
-        return (
-          <link
-            rel="stylesheet"
-            href={fullHref}
-            // @ts-ignore
-            precedence={precedence}
-            crossOrigin={ctx.renderOpts.crossOrigin}
-            key={index}
-          />
-        )
+  const scripts: React.ReactNode[] = []
+  let scriptIndex = 0
+  for (const href of jsHrefs) {
+    scripts.push(
+      createElement('script', {
+        src: `${ctx.assetPrefix}/_next/${encodeURIPath(href)}${getAssetQueryString(ctx, true)}`,
+        async: true,
+        key: `script-${scriptIndex}`,
+        nonce: ctx.nonce,
       })
-    : null
-
-  const scripts = jsHrefs
-    ? jsHrefs.map((href) => (
-        <script src={`${ctx.assetPrefix}/_next/${href}`} async={true} />
-      ))
-    : null
+    )
+    scriptIndex++
+  }
 
   const Comp = interopDefault(await getComponent())
 
-  return [Comp, styles, scripts]
+  return [Comp, styles, scripts.length ? scripts : null]
 }

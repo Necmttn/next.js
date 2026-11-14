@@ -1,9 +1,23 @@
 import { notFound } from 'next/navigation'
+import { Suspense } from 'react'
 
-export default function DynamicPage({ params }) {
-  if (params.slug === '404') {
+async function Content({ params }: { params: Promise<{ slug: string }> }) {
+  const { slug } = await params
+  if (slug === '404') {
     notFound()
   }
 
-  return <p id="dynamic">Dynamic page: {params.slug}</p>
+  return <p id="dynamic">Dynamic page: {slug}</p>
+}
+
+export default function DynamicPage({
+  params,
+}: {
+  params: Promise<{ slug: string }>
+}) {
+  return (
+    <Suspense>
+      <Content params={params} />
+    </Suspense>
+  )
 }

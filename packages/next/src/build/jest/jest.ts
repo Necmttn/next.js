@@ -5,9 +5,12 @@ import { PHASE_TEST } from '../../shared/lib/constants'
 import loadJsConfig from '../load-jsconfig'
 import * as Log from '../output/log'
 import { findPagesDir } from '../../lib/find-pages-dir'
-import { loadBindings, lockfilePatchPromise } from '../swc'
+import { lockfilePatchPromise } from '../swc'
+import { installBindings } from '../swc/install-bindings'
 import type { JestTransformerConfig } from '../swc/jest-transformer'
 import type { Config } from '@jest/types'
+
+const DEFAULT_TRANSPILED_PACKAGES: string[] = require('../../lib/default-transpiled-packages.json')
 
 async function getConfig(dir: string) {
   const conf = await loadConfig(PHASE_TEST, dir)
@@ -35,21 +38,26 @@ function setUpEnv(dir: string) {
   loadEnvConfig(dir, dev, Log)
 }
 
-/*
-// Usage in jest.config.js
-const nextJest = require('next/jest');
-
-// Optionally provide path to Next.js app which will enable loading next.config.js and .env files
-const createJestConfig = nextJest({ dir })
-
-// Any custom config you want to pass to Jest
-const customJestConfig = {
-    setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
-}
-
-// createJestConfig is exported in this way to ensure that next/jest can load the Next.js config which is async
-module.exports = createJestConfig(customJestConfig)
-*/
+/**
+ * @example
+ * ```ts
+ * // Usage in jest.config.js
+ * const nextJest = require('next/jest');
+ *
+ * // Optionally provide path to Next.js app which will enable loading next.config.js and .env files
+ * const createJestConfig = nextJest({ dir })
+ *
+ * // Any custom config you want to pass to Jest
+ * const customJestConfig = {
+ *     setupFilesAfterEnv: ['<rootDir>/jest.setup.js'],
+ * }
+ *
+ * // createJestConfig is exported in this way to ensure that next/jest can load the Next.js config which is async
+ * module.exports = createJestConfig(customJestConfig)
+ * ```
+ *
+ * Read more: [Next.js Docs: Setting up Jest with Next.js](https://nextjs.org/docs/app/building-your-application/testing/jest)
+ */
 export default function nextJest(options: { dir?: string } = {}) {
   // createJestConfig
   return (
@@ -89,13 +97,40 @@ export default function nextJest(options: { dir?: string } = {}) {
           : customJestConfig) ?? {}
 
       // eagerly load swc bindings instead of waiting for transform calls
-      await loadBindings(nextConfig?.experimental?.useWasmBinary)
+      await installBindings(nextConfig?.experimental?.useWasmBinary)
 
       if (lockfilePatchPromise.cur) {
         await lockfilePatchPromise.cur
       }
 
-      const transpiled = (nextConfig?.transpilePackages ?? []).join('|')
+      const imageConfig = nextConfig?.images
+        ? {
+            deviceSizes: nextConfig.images.deviceSizes,
+            imageSizes: nextConfig.images.imageSizes,
+            qualities: nextConfig.images.qualities,
+            path: nextConfig.images.path,
+            loader: nextConfig.images.loader,
+            dangerouslyAllowSVG: nextConfig.images.dangerouslyAllowSVG,
+            unoptimized: nextConfig.images.unoptimized,
+          }
+        : undefined
+
+      const transpiled = (nextConfig?.transpilePackages ?? [])
+        .concat(DEFAULT_TRANSPILED_PACKAGES)
+        .concat(
+          imageConfig
+            ? [
+                // Dist paths for normal package resolution.
+                'next/dist/client',
+                'next/dist/shared/lib',
+                // Source paths can appear under pnpm file: installs.
+                'next/src/client',
+                'next/src/shared/lib',
+              ]
+            : []
+        )
+        .join('|')
+      const transpiledPathRegex = transpiled.replace(/\//g, '[\\\\/]')
 
       const jestTransformerConfig: JestTransformerConfig = {
         modularizeImports: nextConfig?.modularizeImports,
@@ -106,7 +141,10 @@ export default function nextJest(options: { dir?: string } = {}) {
         serverComponents,
         isEsmProject,
         pagesDir,
+        imageConfig,
+        configDir: options.dir,
       }
+
       return {
         ...resolvedJestConfig,
 
@@ -132,7 +170,7 @@ export default function nextJest(options: { dir?: string } = {}) {
           // Handle next/font
           'next/font/(.*)': require.resolve('./__mocks__/nextFontMock.js'),
           // Disable server-only
-          'server-only': require.resolve('./__mocks__/empty.js'),
+          '^server-only$': require.resolve('./__mocks__/empty.js'),
 
           // custom config comes last to ensure the above rules are matched,
           // fixes the case where @pages/(.*) -> src/pages/$! doesn't break
@@ -164,10 +202,13 @@ export default function nextJest(options: { dir?: string } = {}) {
           ...(transpiled
             ? [
                 `/node_modules/(?!.pnpm)(?!(${transpiled})/)`,
-                `/node_modules/.pnpm/(?!(${transpiled.replace(
+                // For pnpm: standard packages use "next@version", but file: refs
+                // use "file+..+next-repo-...". Don't ignore when the path leads
+                // to a transpiled package (e.g. .../node_modules/next/).
+                `/node_modules[\\\\/]\\.pnpm[\\\\/](?!(${transpiled.replace(
                   /\//g,
                   '\\+'
-                )})@)`,
+                )})@)(?!.*node_modules[\\\\/](${transpiledPathRegex})[\\\\/])`,
               ]
             : ['/node_modules/']),
           // CSS modules are mocked so they don't need to be transformed

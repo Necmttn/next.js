@@ -1,11 +1,14 @@
-import type { NextEnabledDirectories } from '../../server/base-server'
-
 import path from 'path'
 import { IncrementalCache } from '../../server/lib/incremental-cache'
-import { hasNextSupport } from '../../telemetry/ci-info'
+import { hasNextSupport } from '../../server/ci-info'
 import { nodeFs } from '../../server/lib/node-fs-methods'
 import { interopDefault } from '../../lib/interop-default'
 import { formatDynamicImportPath } from '../../lib/format-dynamic-import-path'
+import {
+  initializeCacheHandlers,
+  registerCustomCacheHandlers,
+  setCacheHandler,
+} from '../../server/use-cache/handlers'
 
 export async function createIncrementalCache({
   cacheHandler,
@@ -13,18 +16,18 @@ export async function createIncrementalCache({
   fetchCacheKeyPrefix,
   distDir,
   dir,
-  enabledDirectories,
-  experimental,
   flushToDisk,
+  cacheHandlers,
+  requestHeaders,
 }: {
   cacheHandler?: string
-  cacheMaxMemorySize?: number
+  cacheMaxMemorySize: number
   fetchCacheKeyPrefix?: string
   distDir: string
   dir: string
-  enabledDirectories: NextEnabledDirectories
-  experimental: { ppr: boolean }
   flushToDisk?: boolean
+  requestHeaders?: Record<string, string | string[] | undefined>
+  cacheHandlers?: Record<string, string | undefined>
 }) {
   // Custom cache handler overrides.
   let CacheHandler: any
@@ -36,31 +39,47 @@ export async function createIncrementalCache({
     )
   }
 
+  if (cacheHandlers) {
+    initializeCacheHandlers(cacheMaxMemorySize)
+    await registerCustomCacheHandlers(async () => {
+      for (const [kind, handler] of Object.entries(cacheHandlers)) {
+        if (!handler) continue
+
+        setCacheHandler(
+          kind,
+          interopDefault(
+            await import(formatDynamicImportPath(dir, handler)).then(
+              (mod) => mod.default || mod
+            )
+          )
+        )
+      }
+    })
+  }
+
+  let previewProps = {
+    previewModeEncryptionKey: '',
+    previewModeId: '',
+    previewModeSigningKey: '',
+  }
   const incrementalCache = new IncrementalCache({
     dev: false,
-    requestHeaders: {},
+    requestHeaders: requestHeaders || {},
     flushToDisk,
-    fetchCache: true,
     maxMemoryCacheSize: cacheMaxMemorySize,
     fetchCacheKeyPrefix,
-    getPrerenderManifest: () => ({
+    previewProps,
+    prerenderManifest: {
       version: 4,
       routes: {},
       dynamicRoutes: {},
-      preview: {
-        previewModeEncryptionKey: '',
-        previewModeId: '',
-        previewModeSigningKey: '',
-      },
       notFoundRoutes: [],
-    }),
+      preview: previewProps,
+    },
     fs: nodeFs,
-    pagesDir: enabledDirectories.pages,
-    appDir: enabledDirectories.app,
     serverDistDir: path.join(distDir, 'server'),
     CurCacheHandler: CacheHandler,
     minimalMode: hasNextSupport,
-    experimental,
   })
 
   ;(globalThis as any).__incrementalCache = incrementalCache

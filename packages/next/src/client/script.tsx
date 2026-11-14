@@ -1,11 +1,12 @@
 'use client'
 
 import ReactDOM from 'react-dom'
-import React, { useEffect, useContext, useRef } from 'react'
+import React, { useEffect, useContext, useRef, type JSX } from 'react'
 import type { ScriptHTMLAttributes } from 'react'
 import { HeadManagerContext } from '../shared/lib/head-manager-context.shared-runtime'
-import { DOMAttributeNames } from './head-manager'
+import { setAttributesFromProps } from './set-attributes-from-props'
 import { requestIdleCallback } from './request-idle-callback'
+import { htmlEscapeJsonString } from '../shared/lib/htmlescape'
 
 const ScriptCache = new Map()
 const LoadCache = new Set()
@@ -24,16 +25,6 @@ export interface ScriptProps extends ScriptHTMLAttributes<HTMLScriptElement> {
  * @deprecated Use `ScriptProps` instead.
  */
 export type Props = ScriptProps
-
-const ignoreProps = [
-  'onLoad',
-  'onReady',
-  'dangerouslySetInnerHTML',
-  'children',
-  'onError',
-  'strategy',
-  'stylesheets',
-]
 
 const insertStylesheets = (stylesheets: string[]) => {
   // Case 1: Styles for afterInteractive/lazyOnload with appDir injected via handleClientScriptLoad
@@ -136,8 +127,8 @@ const loadScript = (props: ScriptProps): void => {
       typeof children === 'string'
         ? children
         : Array.isArray(children)
-        ? children.join('')
-        : ''
+          ? children.join('')
+          : ''
 
     afterLoad()
   } else if (src) {
@@ -148,14 +139,7 @@ const loadScript = (props: ScriptProps): void => {
     ScriptCache.set(src, loadPromise)
   }
 
-  for (const [k, value] of Object.entries(props)) {
-    if (value === undefined || ignoreProps.includes(k)) {
-      continue
-    }
-
-    const attr = DOMAttributeNames[k] || k.toLowerCase()
-    el.setAttribute(attr, value)
-  }
+  setAttributesFromProps(el, props)
 
   if (strategy === 'worker') {
     el.setAttribute('type', 'text/partytown')
@@ -208,6 +192,11 @@ export function initScriptLoader(scriptLoaderItems: ScriptProps[]) {
   addBeforeInteractiveToCache()
 }
 
+/**
+ * Load a third-party scripts in an optimized way.
+ *
+ * Read more: [Next.js Docs: `next/script`](https://nextjs.org/docs/app/api-reference/components/script)
+ */
 function Script(props: ScriptProps): JSX.Element | null {
   const {
     id,
@@ -221,8 +210,11 @@ function Script(props: ScriptProps): JSX.Element | null {
   } = props
 
   // Context is available only during SSR
-  const { updateScripts, scripts, getIsSsr, appDir, nonce } =
+  let { updateScripts, scripts, getIsSsr, appDir, nonce } =
     useContext(HeadManagerContext)
+
+  // if a nonce is explicitly passed to the script tag, favor that over the automatic handling
+  nonce = restProps.nonce || nonce
 
   /**
    * - First mount:
@@ -288,6 +280,7 @@ function Script(props: ScriptProps): JSX.Element | null {
           onReady,
           onError,
           ...restProps,
+          nonce,
         },
       ])
       updateScripts(scripts)
@@ -295,7 +288,10 @@ function Script(props: ScriptProps): JSX.Element | null {
       // Script has already loaded during SSR
       LoadCache.add(id || src)
     } else if (getIsSsr && !getIsSsr()) {
-      loadScript(props)
+      loadScript({
+        ...props,
+        nonce,
+      })
     }
   }
 
@@ -332,10 +328,9 @@ function Script(props: ScriptProps): JSX.Element | null {
           <script
             nonce={nonce}
             dangerouslySetInnerHTML={{
-              __html: `(self.__next_s=self.__next_s||[]).push(${JSON.stringify([
-                0,
-                { ...restProps, id },
-              ])})`,
+              __html: `(self.__next_s=self.__next_s||[]).push(${htmlEscapeJsonString(
+                JSON.stringify([0, { ...restProps, id }])
+              )})`,
             }}
           />
         )
@@ -344,17 +339,21 @@ function Script(props: ScriptProps): JSX.Element | null {
         ReactDOM.preload(
           src,
           restProps.integrity
-            ? { as: 'script', integrity: restProps.integrity }
-            : { as: 'script' }
+            ? {
+                as: 'script',
+                integrity: restProps.integrity,
+                nonce,
+                crossOrigin: restProps.crossOrigin,
+              }
+            : { as: 'script', nonce, crossOrigin: restProps.crossOrigin }
         )
         return (
           <script
             nonce={nonce}
             dangerouslySetInnerHTML={{
-              __html: `(self.__next_s=self.__next_s||[]).push(${JSON.stringify([
-                src,
-                { ...restProps, id },
-              ])})`,
+              __html: `(self.__next_s=self.__next_s||[]).push(${htmlEscapeJsonString(
+                JSON.stringify([src, { ...restProps, id }])
+              )})`,
             }}
           />
         )
@@ -365,8 +364,13 @@ function Script(props: ScriptProps): JSX.Element | null {
         ReactDOM.preload(
           src,
           restProps.integrity
-            ? { as: 'script', integrity: restProps.integrity }
-            : { as: 'script' }
+            ? {
+                as: 'script',
+                integrity: restProps.integrity,
+                nonce,
+                crossOrigin: restProps.crossOrigin,
+              }
+            : { as: 'script', nonce, crossOrigin: restProps.crossOrigin }
         )
       }
     }

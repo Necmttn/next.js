@@ -1,19 +1,66 @@
-import { createNextDescribe } from 'e2e-utils'
-import { check } from 'next-test-utils'
+import { nextTestSetup } from 'e2e-utils'
+import { NextAdapter } from 'next'
+import { retry } from 'next-test-utils'
 import { join } from 'node:path'
 
-const deploymentId = Date.now() + ''
+const immutableAssetsFilter = (p) =>
+  p.includes('/_next/static/') &&
+  !(
+    p.includes('/_buildManifest.js') ||
+    p.includes('/_clientMiddlewareManifest.js') ||
+    p.includes('/_ssgManifest.js')
+  )
 
-createNextDescribe(
-  'deployment-id-handling enabled',
-  {
-    files: join(__dirname, 'app'),
-    env: {
-      NEXT_DEPLOYMENT_ID: deploymentId,
-      USE_DEPLOYMENT_ID: '1',
-    },
-  },
-  ({ next }) => {
+describe.each([
+  ['NEXT_DEPLOYMENT_ID', ''],
+  ['CUSTOM_DEPLOYMENT_ID', ''],
+  ['NEXT_DEPLOYMENT_ID', ' and runtimeServerDeploymentId'],
+  ['NEXT_DEPLOYMENT_ID_IMMUTABLE', ''],
+])(
+  'deployment-id-handling enabled with %s%s',
+  (envKey, runtimeServerDeploymentId) => {
+    const usesImmutableAssets = envKey === 'NEXT_DEPLOYMENT_ID_IMMUTABLE'
+
+    if (usesImmutableAssets && !process.env.IS_TURBOPACK_TEST) {
+      it.skip('skip for webpack', () => {})
+      return
+    }
+
+    const deploymentId = Date.now() + ''
+    const immutableAssetToken = usesImmutableAssets ? '' : deploymentId
+
+    const { next } = nextTestSetup({
+      files: join(__dirname, 'app'),
+      env: {
+        [envKey]: deploymentId,
+        RUNTIME_SERVER_DEPLOYMENT_ID: runtimeServerDeploymentId
+          ? '1'
+          : undefined,
+      },
+      disableAutoSkewProtection: true,
+    })
+
+    const validateTokenForRequest = (url: string) => {
+      const token =
+        usesImmutableAssets && immutableAssetsFilter(url)
+          ? // Turbopack-emitted chunks
+            immutableAssetToken
+          : // e.g. /_next/static/build-id/_ssgManifest.js
+            deploymentId
+      if (token) {
+        expect(url).toContain('dpl=' + token)
+      } else {
+        expect(url).not.toContain('dpl=')
+      }
+    }
+
+    it('uses the constant build ID when generateBuildId is not configured', async () => {
+      const $ = await next.render$('/')
+      expect(JSON.parse($('script#__NEXT_DATA__').html()!).buildId).toBe(
+        'build-TfctsWXpff2fKS'
+      )
+    })
+
     it.each([
       { urlPath: '/' },
       { urlPath: '/pages-edge' },
@@ -22,6 +69,7 @@ createNextDescribe(
     ])(
       'should append dpl query to all assets correctly for $urlPath',
       async ({ urlPath }) => {
+        // Validate SSR response
         const $ = await next.render$(urlPath)
 
         expect($('#deploymentId').text()).toBe(deploymentId)
@@ -31,7 +79,7 @@ createNextDescribe(
 
         for (const script of scripts) {
           if (script.attribs.src) {
-            expect(script.attribs.src).toContain('dpl=' + deploymentId)
+            validateTokenForRequest(script.attribs.src)
           }
         }
 
@@ -39,35 +87,48 @@ createNextDescribe(
         expect(links.length).toBeGreaterThan(0)
 
         for (const link of links) {
-          if (link.attribs.href) {
-            if (link.attribs.as === 'font') {
-              expect(link.attribs.href).not.toContain('dpl=' + deploymentId)
-            } else {
-              expect(link.attribs.href).toContain('dpl=' + deploymentId)
-            }
+          if (link.attribs.href && link.attribs.rel !== 'expect') {
+            validateTokenForRequest(link.attribs.href)
           }
         }
 
-        const browser = await next.browser(urlPath)
-        const requests = []
+        // Validate all requests ever performed by a browser
 
-        browser.on('request', (req) => {
-          requests.push(req.url())
+        const clientRequests = []
+
+        const browser = await next.browser(urlPath, {
+          beforePageLoad(page) {
+            page.on('request', async (req) => {
+              // TODO this currently exclude _next/image
+              if (req.url().includes('/_next/static')) {
+                clientRequests.push(req.url())
+              }
+            })
+          },
         })
 
+        const dynamicImportRequests = []
+        browser.on('request', (req) => {
+          if (req.url().includes('/_next/static')) {
+            dynamicImportRequests.push(req.url())
+          }
+        })
         await browser.elementByCss('#dynamic-import').click()
-
-        await check(
-          () => (requests.length > 0 ? 'success' : JSON.stringify(requests)),
-          'success'
-        )
+        await retry(() => expect(dynamicImportRequests).not.toBeEmpty())
 
         try {
-          expect(
-            requests.every((item) => item.includes('dpl=' + deploymentId))
-          ).toBe(true)
+          dynamicImportRequests.forEach((item) => validateTokenForRequest(item))
         } finally {
-          require('console').error('requests', requests)
+          require('console').error(
+            'dynamicImportRequests',
+            dynamicImportRequests
+          )
+        }
+
+        try {
+          clientRequests.forEach((item) => validateTokenForRequest(item))
+        } finally {
+          require('console').error('clientRequests', clientRequests)
         }
       }
     )
@@ -82,85 +143,165 @@ createNextDescribe(
         })
       }
     )
+
+    it('should contain deployment id in prefetch request', async () => {
+      const dataHeaders = []
+      const browser = await next.browser('/', {
+        beforePageLoad(page) {
+          page.on('request', async (req) => {
+            const headers = req.headers()
+            if (headers['x-nextjs-data']) {
+              dataHeaders.push(headers)
+            }
+          })
+        },
+      })
+
+      await browser.elementByCss('#edge-link').click()
+
+      await retry(async () => {
+        expect(await browser.elementByCss('h1').text()).toBe('hello pages edge')
+        expect(await browser.url()).toContain('/pages-edge')
+        expect(dataHeaders.length).toBeGreaterThan(0)
+      })
+
+      expect(
+        dataHeaders.every(
+          (headers) => headers['x-deployment-id'] === deploymentId
+        )
+      ).toBe(true)
+    })
+
+    it('should contain deployment id in RSC payload request headers', async () => {
+      const rscHeaders = []
+      const browser = await next.browser('/from-app', {
+        beforePageLoad(page) {
+          page.on('request', async (req) => {
+            const headers = req.headers()
+            if (headers['rsc']) {
+              rscHeaders.push(headers)
+            }
+          })
+        },
+      })
+
+      await browser.elementByCss('#other-app').click()
+
+      await retry(async () => {
+        expect(await browser.elementByCss('h1').text()).toBe('other app')
+        expect(await browser.url()).toContain('/other-app')
+        expect(rscHeaders.length).toBeGreaterThan(0)
+      })
+
+      expect(rscHeaders).toSatisfyAll(
+        (headers) => headers['x-deployment-id'] === deploymentId
+      )
+    })
+
+    if (usesImmutableAssets) {
+      it('should emit hashes to adapter', async () => {
+        const { outputs }: Parameters<NextAdapter['onBuildComplete']>[0] =
+          await next.readJSON('build-complete.json')
+
+        const immutableAssets = outputs.staticFiles.filter((p) =>
+          immutableAssetsFilter(p.pathname)
+        )
+        expect(immutableAssets).not.toBeEmpty()
+        expect(immutableAssets).toSatisfyAll(
+          (f) =>
+            // Should be same hash as in the filename, for better build performance.
+            // This check also ensure that we don't accidentally forget to content hash sourcemap
+            // files (i.e. 0cz1d0mv5g_q7.js is content hashed, but 0cz1d0mv5g_q7.js.map is not a
+            // content hash of itself)..
+            f.immutableHash &&
+            f.pathname.includes(f.immutableHash.slice(0, 13)) &&
+            f.pathname.startsWith('/_next/static/immutable')
+        )
+      })
+    }
   }
 )
 
-createNextDescribe(
-  'deployment-id-handling disabled',
-  {
+describe('deployment-id-handling with generateBuildId', () => {
+  const { next } = nextTestSetup({
     files: join(__dirname, 'app'),
     env: {
-      NEXT_DEPLOYMENT_ID: deploymentId,
+      CUSTOM_DEPLOYMENT_ID: 'test-deployment-id',
+      CUSTOM_BUILD_ID: 'custom-build-id',
     },
-  },
-  ({ next }) => {
-    it.each([
-      { urlPath: '/' },
-      { urlPath: '/pages-edge' },
-      { urlPath: '/from-app' },
-      { urlPath: '/from-app/edge' },
-    ])(
-      'should not append dpl query to all assets for $urlPath',
-      async ({ urlPath }) => {
-        const $ = await next.render$(urlPath)
+    disableAutoSkewProtection: true,
+  })
 
-        expect($('#deploymentId').text()).not.toBe(deploymentId)
+  it('uses the explicitly configured build ID', async () => {
+    const $ = await next.render$('/')
+    expect(JSON.parse($('script#__NEXT_DATA__').html()!).buildId).toBe(
+      'custom-build-id'
+    )
+  })
+})
 
-        const scripts = Array.from($('script'))
-        expect(scripts.length).toBeGreaterThan(0)
+describe('deployment-id-handling disabled', () => {
+  const deploymentId = Date.now() + ''
+  const { next } = nextTestSetup({
+    files: join(__dirname, 'app'),
+    disableAutoSkewProtection: true,
+  })
 
-        for (const script of scripts) {
-          if (script.attribs.src) {
-            expect(script.attribs.src).not.toContain('dpl=' + deploymentId)
-          }
+  it('generates a build ID without a configured callback', async () => {
+    const $ = await next.render$('/')
+    const buildId = JSON.parse($('script#__NEXT_DATA__').html()!).buildId
+    expect(buildId).toBeTruthy()
+    expect(buildId).not.toBe('build-TfctsWXpff2fKS')
+  })
+
+  it.each([
+    { urlPath: '/' },
+    { urlPath: '/pages-edge' },
+    { urlPath: '/from-app' },
+    { urlPath: '/from-app/edge' },
+  ])(
+    'should not append dpl query to all assets for $urlPath',
+    async ({ urlPath }) => {
+      const $ = await next.render$(urlPath)
+
+      expect($('#deploymentId').text()).not.toBe(deploymentId)
+
+      const scripts = Array.from($('script'))
+      expect(scripts.length).toBeGreaterThan(0)
+
+      for (const script of scripts) {
+        if (script.attribs.src) {
+          expect(script.attribs.src).not.toContain('dpl=' + deploymentId)
         }
+      }
 
-        const links = Array.from($('link'))
-        expect(links.length).toBeGreaterThan(0)
+      const links = Array.from($('link'))
+      expect(links.length).toBeGreaterThan(0)
 
-        for (const link of links) {
-          if (link.attribs.href) {
-            if (link.attribs.as === 'font') {
-              expect(link.attribs.href).not.toContain('dpl=' + deploymentId)
-            } else {
-              expect(link.attribs.href).not.toContain('dpl=' + deploymentId)
-            }
-          }
+      for (const link of links) {
+        if (link.attribs.href) {
+          expect(link.attribs.href).not.toContain('dpl=' + deploymentId)
         }
+      }
 
-        const browser = await next.browser(urlPath)
-        const requests = []
+      const browser = await next.browser(urlPath)
+      const requests = []
 
-        browser.on('request', (req) => {
-          requests.push(req.url())
-        })
+      browser.on('request', (req) => {
+        requests.push(req.url())
+      })
 
-        await browser.elementByCss('#dynamic-import').click()
+      await browser.elementByCss('#dynamic-import').click()
 
-        await check(
-          () => (requests.length > 0 ? 'success' : JSON.stringify(requests)),
-          'success'
+      await retry(() => expect(requests).not.toBeEmpty())
+
+      try {
+        expect(requests).toSatisfyAll(
+          (item) => !item.includes('dpl=' + deploymentId)
         )
-
-        try {
-          expect(
-            requests.every((item) => !item.includes('dpl=' + deploymentId))
-          ).toBe(true)
-        } finally {
-          require('console').error('requests', requests)
-        }
+      } finally {
+        require('console').error('requests', requests)
       }
-    )
-
-    it.each([{ pathname: '/api/hello' }, { pathname: '/api/hello-app' }])(
-      'should not have deployment id env available',
-      async ({ pathname }) => {
-        const res = await next.fetch(pathname)
-
-        expect(await res.json()).not.toEqual({
-          deploymentId,
-        })
-      }
-    )
-  }
-)
+    }
+  )
+})

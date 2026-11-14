@@ -1,51 +1,24 @@
 import path from 'path'
-import { createNext, FileRef } from 'e2e-utils'
-import { NextInstance } from 'test/lib/next-modes/base'
-import webdriver from 'next-webdriver'
-import { shouldRunTurboDevTest } from '../../lib/next-test-utils'
+import { FileRef, nextTestSetup } from 'e2e-utils'
 
 describe('transpile packages', () => {
-  let next: NextInstance
-
-  if ((global as any).isNextDeploy) {
-    it('should skip for deploy mode for now', () => {})
-    return
-  }
-
-  beforeAll(async () => {
-    next = await createNext({
-      files: new FileRef(path.join(__dirname, './npm')),
-      dependencies: {
-        react: 'latest',
-        'react-dom': 'latest',
-        sass: 'latest',
-      },
-      packageJson: {
-        scripts: {
-          setup: `cp -r ./node_modules_bak/* ./node_modules`,
-          build: 'yarn setup && next build',
-          dev: `yarn setup && next ${
-            shouldRunTurboDevTest() ? 'dev --turbo' : 'dev'
-          }`,
-          start: 'next start',
-        },
-      },
-      installCommand: 'yarn',
-      startCommand: (global as any).isNextDev ? 'yarn dev' : 'yarn start',
-      buildCommand: 'yarn build',
-    })
+  const { next } = nextTestSetup({
+    files: new FileRef(path.join(__dirname, './npm')),
+    dependencies: {
+      sass: 'latest',
+    },
   })
-  afterAll(() => next.destroy())
 
-  const { isNextDeploy } = global as any
-  if (isNextDeploy) {
-    it('should skip tests for next-deploy and react 17', () => {})
-    return
-  }
+  // TODO: This test is failing in Turbopack
+  it.skip('should handle optional peer dependencies', async () => {
+    const browser = await next.browser('/peer-deps')
+
+    expect(await browser.elementByCss('h1').text()).toBe('world')
+  })
 
   describe('css', () => {
     it('should handle global css imports inside transpiled modules', async () => {
-      const browser = await webdriver(next.url, '/global-css')
+      const browser = await next.browser('/global-css')
 
       expect(
         await browser.eval(
@@ -55,7 +28,7 @@ describe('transpile packages', () => {
     })
 
     it('should handle global scss imports inside transpiled modules', async () => {
-      const browser = await webdriver(next.url, '/global-scss')
+      const browser = await next.browser('/global-scss')
 
       expect(
         await browser.eval(
@@ -65,7 +38,7 @@ describe('transpile packages', () => {
     })
 
     it('should handle css modules imports inside transpiled modules', async () => {
-      const browser = await webdriver(next.url, '/css-modules')
+      const browser = await next.browser('/css-modules')
 
       expect(
         await browser.eval(
@@ -75,7 +48,7 @@ describe('transpile packages', () => {
     })
 
     it('should handle scss modules imports inside transpiled modules', async () => {
-      const browser = await webdriver(next.url, '/scss-modules')
+      const browser = await next.browser('/scss-modules')
 
       expect(
         await browser.eval(

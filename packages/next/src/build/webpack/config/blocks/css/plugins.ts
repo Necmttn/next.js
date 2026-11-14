@@ -47,7 +47,7 @@ const createLazyPostCssPlugin = (
 ): import('postcss').AcceptedPlugin => {
   let result: any = undefined
   const plugin = (...args: any[]) => {
-    if (result === undefined) result = fn() as any
+    if (result === undefined) result = fn()
     if (result.postcss === true) {
       return result(...args)
     } else if (result.postcss) {
@@ -116,7 +116,8 @@ function getDefaultPlugins(
 export async function getPostCssPlugins(
   dir: string,
   supportedBrowsers: string[] | undefined,
-  disablePostcssPresetEnv: boolean = false
+  disablePostcssPresetEnv: boolean = false,
+  useLightningcss: boolean = false
 ): Promise<import('postcss').AcceptedPlugin[]> {
   let config = await findConfig<{ plugins: CssPluginCollection }>(
     dir,
@@ -125,7 +126,9 @@ export async function getPostCssPlugins(
 
   if (config == null) {
     config = {
-      plugins: getDefaultPlugins(supportedBrowsers, disablePostcssPresetEnv),
+      plugins: useLightningcss
+        ? []
+        : getDefaultPlugins(supportedBrowsers, disablePostcssPresetEnv),
     }
   }
 

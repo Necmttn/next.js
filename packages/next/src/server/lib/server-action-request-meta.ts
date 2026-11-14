@@ -1,27 +1,36 @@
 import type { IncomingMessage } from 'http'
 import type { BaseNextRequest } from '../base-http'
 import type { NextRequest } from '../web/exports'
-import { ACTION } from '../../client/components/app-router-headers'
+import { ACTION_HEADER } from '../../client/components/app-router-headers'
+
+export type ServerActionRequestMetadata = {
+  readonly actionId: string | null
+  readonly isURLEncodedAction: boolean
+  readonly isMultipartAction: boolean
+  readonly isFetchAction: boolean
+  readonly isPossibleServerAction: boolean
+}
 
 export function getServerActionRequestMetadata(
-  req: IncomingMessage | BaseNextRequest | NextRequest
-): {
-  actionId: string | null
-  isURLEncodedAction: boolean
-  isMultipartAction: boolean
-  isFetchAction: boolean
-} {
+  req: Pick<
+    IncomingMessage | BaseNextRequest | NextRequest,
+    'headers' | 'method'
+  >
+): ServerActionRequestMetadata {
   let actionId: string | null
   let contentType: string | null
 
   if (req.headers instanceof Headers) {
-    actionId = req.headers.get(ACTION.toLowerCase()) ?? null
+    actionId = req.headers.get(ACTION_HEADER) ?? null
     contentType = req.headers.get('content-type')
   } else {
-    actionId = (req.headers[ACTION.toLowerCase()] as string) ?? null
+    actionId = (req.headers[ACTION_HEADER] as string) ?? null
     contentType = req.headers['content-type'] ?? null
   }
 
+  // We don't actually support URL encoded actions, and the action handler will bail out if it sees one.
+  // But we still want it to flow through to the action handler, to prevent changes in behavior when a regular
+  // page component tries to handle a POST.
   const isURLEncodedAction = Boolean(
     req.method === 'POST' && contentType === 'application/x-www-form-urlencoded'
   )
@@ -34,14 +43,21 @@ export function getServerActionRequestMetadata(
       req.method === 'POST'
   )
 
-  return { actionId, isURLEncodedAction, isMultipartAction, isFetchAction }
+  const isPossibleServerAction = Boolean(
+    isFetchAction || isURLEncodedAction || isMultipartAction
+  )
+
+  return {
+    actionId,
+    isURLEncodedAction,
+    isMultipartAction,
+    isFetchAction,
+    isPossibleServerAction,
+  }
 }
 
-export function getIsServerAction(
+export function getIsPossibleServerAction(
   req: IncomingMessage | BaseNextRequest | NextRequest
 ): boolean {
-  const { isFetchAction, isURLEncodedAction, isMultipartAction } =
-    getServerActionRequestMetadata(req)
-
-  return Boolean(isFetchAction || isURLEncodedAction || isMultipartAction)
+  return getServerActionRequestMetadata(req).isPossibleServerAction
 }

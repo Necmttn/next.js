@@ -1,51 +1,147 @@
 // this must come first as it includes require hooks
 import type { WorkerRequestHandler, WorkerUpgradeHandler } from './types'
-import type { DevBundler } from './router-utils/setup-dev-bundler'
-import type { NextUrlWithParsedQuery } from '../request-meta'
+import type { DevBundler, ServerFields } from './router-utils/setup-dev-bundler'
+import type { NextUrlWithParsedQuery, RequestMeta } from '../request-meta'
+
 // This is required before other imports to ensure the require hook is setup.
 import '../node-environment'
 import '../require-hook'
 
 import url from 'url'
 import path from 'path'
-import loadConfig from '../config'
+import loadConfig, { type ConfiguredExperimentalFeature } from '../config'
+import { finalizeBundlerFromConfig, getBundlerFromEnv } from '../../lib/bundler'
 import { serveStatic } from '../serve-static'
 import setupDebug from 'next/dist/compiled/debug'
-import { Telemetry } from '../../telemetry/storage'
+import * as Log from '../../build/output/log'
+import {
+  isUnhandledRejectionListenerRegistered,
+  registerUnhandledRejectionListener,
+} from '../node-environment-extensions/process-error-handlers'
 import { DecodeError } from '../../shared/lib/utils'
+import { deobfuscateText } from '../../shared/lib/magic-identifier'
 import { findPagesDir } from '../../lib/find-pages-dir'
 import { setupFsCheck } from './router-utils/filesystem'
 import { proxyRequest } from './router-utils/proxy-request'
 import { isAbortError, pipeToNodeResponse } from '../pipe-readable'
 import { getResolveRoutes } from './router-utils/resolve-routes'
-import { getRequestMeta } from '../request-meta'
+import { addRequestMeta, getRequestMeta } from '../request-meta'
 import { pathHasPrefix } from '../../shared/lib/router/utils/path-has-prefix'
 import { removePathPrefix } from '../../shared/lib/router/utils/remove-path-prefix'
 import setupCompression from 'next/dist/compiled/compression'
-import { NoFallbackError } from '../base-server'
+import { releaseCompressionStream } from './release-compression-stream'
 import { signalFromNodeResponse } from '../web/spec-extension/adapters/next-request'
-import { isPostpone } from './router-utils/is-postpone'
+import { isNonHtmlSecFetchDest } from './is-non-html-sec-fetch-dest'
+import { parseUrl as parseUrlUtil } from '../../shared/lib/router/utils/parse-url'
 
 import {
   PHASE_PRODUCTION_SERVER,
   PHASE_DEVELOPMENT_SERVER,
+  REQUEST_INSIGHTS_DEV_ENDPOINT,
+  UNDERSCORE_NOT_FOUND_ROUTE,
 } from '../../shared/lib/constants'
 import { RedirectStatusCode } from '../../client/components/redirect-status-code'
 import { DevBundlerService } from './dev-bundler-service'
 import { type Span, trace } from '../../trace'
 import { ensureLeadingSlash } from '../../shared/lib/page-path/ensure-leading-slash'
+import { getNextPathnameInfo } from '../../shared/lib/router/utils/get-next-pathname-info'
+import { getHostname } from '../../shared/lib/get-hostname'
+import { detectDomainLocale } from '../../shared/lib/i18n/detect-domain-locale'
+import { MockedResponse } from './mock-request'
+import {
+  HMR_MESSAGE_SENT_TO_BROWSER,
+  type AppIsrManifestMessage,
+} from '../dev/hot-reloader-types'
+import { normalizedAssetPrefix } from '../../shared/lib/normalized-asset-prefix'
+import { NEXT_PATCH_SYMBOL } from './patch-fetch-symbol'
+import type { ServerInitResult } from './render-server'
+import { filterInternalHeaders } from './server-ipc/utils'
+import { blockCrossSiteDEV } from './router-utils/block-cross-site-dev'
+import { traceGlobals } from '../../trace/shared'
+import { NoFallbackError } from '../../shared/lib/no-fallback-error.external'
+import {
+  RouterServerContextSymbol,
+  routerServerGlobal,
+} from './router-utils/router-server-context'
+import {
+  handleChromeDevtoolsWorkspaceRequest,
+  isChromeDevtoolsWorkspaceUrl,
+} from './chrome-devtools-workspace'
+import { getNextConfigRuntime, type NextConfigComplete } from '../config-shared'
+import { isCI } from '../ci-info'
+import {
+  completeRequestInsight,
+  getRequestInsightsHistory,
+  getRequestInsightsSnapshot,
+  isRequestInsightsEnabled,
+  readRequestInsightsHistory,
+  recordRequestInsightSource,
+} from './trace/request-insights'
+import {
+  NEXT_HTML_REQUEST_ID_HEADER,
+  NEXT_REQUEST_ID_HEADER,
+} from '../../client/components/app-router-headers'
+import { nanoid } from 'next/dist/compiled/nanoid'
+import { filterInvalidDevRequestIdHeaders } from './dev-request-id'
+import { resolveRequestInsightsIdentity } from './trace/request-insights-identity'
+import { waitForResponseToFinish } from '../app-render/wait-for-response'
+import {
+  REQUEST_INSIGHT_FILTERS,
+  type RequestInsightFilter,
+} from '../../shared/lib/request-insights-summary'
+import { MAX_LIVE_COMPLETED_REQUEST_INSIGHTS } from '../../shared/lib/request-insights'
 
 const debug = setupDebug('next:router-server:main')
 const isNextFont = (pathname: string | null) =>
   pathname && /\/media\/[^/]+\.(woff|woff2|eot|ttf|otf)$/.test(pathname)
 
+// ModuleBuildError can cross compiled module boundaries, so constructor
+// identity is not reliable. Check its stable fields and string prefix instead.
+function isModuleBuildError(error: unknown): boolean {
+  if (!error || typeof error !== 'object') {
+    return false
+  }
+
+  const maybeError = error as {
+    code?: unknown
+    constructor?: { name?: unknown }
+    name?: unknown
+  }
+  const errorString = String(error)
+
+  return (
+    maybeError.name === 'ModuleBuildError' ||
+    maybeError.code === 'ModuleBuildError' ||
+    maybeError.constructor?.name === 'ModuleBuildError' ||
+    errorString.startsWith('ModuleBuildError:') ||
+    errorString.startsWith('Error [ModuleBuildError]:')
+  )
+}
+
+function getErrorMessage(error: unknown): string {
+  if (
+    error &&
+    typeof error === 'object' &&
+    'message' in error &&
+    typeof error.message === 'string'
+  ) {
+    return deobfuscateText(error.message)
+  }
+
+  return deobfuscateText(String(error))
+}
+
+function parseRequestInsightsHistoryLimit(value: string | null): number {
+  const parsed = value === null ? NaN : Number.parseInt(value, 10)
+  return Number.isFinite(parsed) ? Math.min(Math.max(parsed, 1), 200) : 100
+}
+
 export type RenderServer = Pick<
   typeof import('./render-server'),
   | 'initialize'
-  | 'deleteCache'
   | 'clearModuleContext'
-  | 'deleteAppClientCache'
   | 'propagateServerField'
+  | 'getServerField'
 >
 
 export interface LazyRenderServerInstance {
@@ -58,26 +154,41 @@ export async function initialize(opts: {
   dir: string
   port: number
   dev: boolean
+  onDevServerCleanup: ((listener: () => Promise<void>) => void) | undefined
   server?: import('http').Server
   minimalMode?: boolean
   hostname?: string
-  isNodeDebugging: boolean
   keepAliveTimeout?: number
   customServer?: boolean
-  experimentalTestProxy?: boolean
   experimentalHttpsServer?: boolean
+  serverFastRefresh?: boolean
   startServerSpan?: Span
-}): Promise<[WorkerRequestHandler, WorkerUpgradeHandler]> {
+  quiet?: boolean
+}): Promise<ServerInitResult> {
   if (!process.env.NODE_ENV) {
     // @ts-ignore not readonly
     process.env.NODE_ENV = opts.dev ? 'development' : 'production'
   }
 
+  // Capture the bundler before loading the config
+  const bundlerBeforeConfig = opts.dev ? getBundlerFromEnv() : undefined
+
+  let experimentalFeatures: ConfiguredExperimentalFeature[] = []
   const config = await loadConfig(
     opts.dev ? PHASE_DEVELOPMENT_SERVER : PHASE_PRODUCTION_SERVER,
     opts.dir,
-    { silent: false }
+    {
+      silent: false,
+      reportExperimentalFeatures(features) {
+        experimentalFeatures = features.toSorted(({ key: a }, { key: b }) =>
+          a.localeCompare(b)
+        )
+      },
+    }
   )
+  if (bundlerBeforeConfig !== undefined) {
+    finalizeBundlerFromConfig(bundlerBeforeConfig)
+  }
 
   let compress: ReturnType<typeof setupCompression> | undefined
 
@@ -94,23 +205,138 @@ export async function initialize(opts: {
 
   const renderServer: LazyRenderServerInstance = {}
 
-  let developmentBundler: DevBundler | undefined
+  let development:
+    | {
+        bundler: DevBundler
+        service: DevBundlerService
+        config: NextConfigComplete
+      }
+    | undefined = undefined
 
-  let devBundlerService: DevBundlerService | undefined
+  let originalFetch = globalThis.fetch
+  let hasVulnerabilityInsight: Promise<boolean> = Promise.resolve(false)
 
   if (opts.dev) {
+    const { Telemetry } =
+      require('../../telemetry/storage') as typeof import('../../telemetry/storage')
+
     const telemetry = new Telemetry({
       distDir: path.join(opts.dir, config.distDir),
     })
+    traceGlobals.set('telemetry', telemetry)
+
     const { pagesDir, appDir } = findPagesDir(opts.dir)
 
     const { setupDevBundler } =
       require('./router-utils/setup-dev-bundler') as typeof import('./router-utils/setup-dev-bundler')
 
+    const resetFetch = () => {
+      globalThis.fetch = originalFetch
+      ;(globalThis as Record<symbol, unknown>)[NEXT_PATCH_SYMBOL] = false
+    }
+
     const setupDevBundlerSpan = opts.startServerSpan
       ? opts.startServerSpan.traceChild('setup-dev-bundler')
       : trace('setup-dev-bundler')
-    developmentBundler = await setupDevBundlerSpan.traceAsyncFn(() =>
+
+    // In development, it's always the complete config.
+    let developmentConfig = config as NextConfigComplete
+
+    // Check only development; production startup does not query advisories.
+    if (
+      developmentConfig.experimental.agentUpgrade === 'security' ||
+      developmentConfig.experimental.agentUpgrade === 'latest' ||
+      developmentConfig.experimental.agentUpgrade === 'experimental-future' ||
+      process.env.__NEXT_AGENT_UPGRADE ||
+      process.env.__NEXT_AGENT_UPGRADE_FORCE_DEVTOOLS_FOR_TESTING === '1'
+    ) {
+      const { nudgeUpgrade, getUpgradeContext, assessUpgrade } =
+        require('../../lib/upgrade/nudge') as typeof import('../../lib/upgrade/nudge')
+      const upgradeContext = getUpgradeContext(developmentConfig)
+      const installedVersion = process.env.__NEXT_VERSION || 'unknown'
+      const policy = upgradeContext.experimental.agentUpgrade
+      const forced = process.env.__NEXT_AGENT_UPGRADE === policy
+      const forceDevToolsForTesting =
+        process.env.__NEXT_AGENT_UPGRADE_FORCE_DEVTOOLS_FOR_TESTING === '1'
+      const assessment: ReturnType<typeof assessUpgrade> =
+        isCI || forceDevToolsForTesting
+          ? Promise.resolve(null)
+          : assessUpgrade(
+              opts.dir,
+              upgradeContext,
+              installedVersion,
+              null,
+              forced
+            )
+      hasVulnerabilityInsight = assessment.then(
+        (result) => result?.kind === 'security' || forceDevToolsForTesting,
+        (error) => {
+          Log.warn(`Could not check the DevTools security insight: ${error}`)
+          return false
+        }
+      )
+      if (process.env.NEXT_PRIVATE_UPGRADE_PROMPT === '1' && process.send) {
+        // The CLI shows the menu; keep serving instead of waiting for it.
+        void Promise.allSettled([assessment]).then(([promptAssessment]) => {
+          if (process.connected) {
+            process.send!({
+              nextUpgradeContext: upgradeContext,
+              telemetryDisabled: process.env.NEXT_TELEMETRY_DISABLED,
+              ...(promptAssessment.status === 'fulfilled'
+                ? { nextUpgradeAssessment: promptAssessment.value }
+                : {}),
+            })
+          }
+        })
+      } else {
+        // CI skips the DevTools assessment, but agents still need the nudge.
+        void nudgeUpgrade(
+          opts.dir,
+          upgradeContext,
+          'dev',
+          null,
+          isCI || forceDevToolsForTesting ? null : assessment,
+          {
+            telemetry,
+            onNudgeId: null,
+          }
+        ).catch((error) => {
+          const { printAndExit } =
+            require('./utils') as typeof import('./utils')
+          const exitCode =
+            error && typeof error === 'object'
+              ? Reflect.get(error, 'exitCode')
+              : undefined
+          printAndExit(
+            error instanceof Error ? error.message : String(error),
+            typeof exitCode === 'number' ? exitCode : 1
+          )
+        })
+      }
+    }
+
+    // Resolve the effective serverFastRefresh value.
+    // Both default to enabled (true). CLI takes precedence over config.
+    const cliServerFastRefresh = opts.serverFastRefresh
+    const configServerFastRefresh =
+      developmentConfig.experimental?.turbopackServerFastRefresh
+    let effectiveServerFastRefresh: boolean | undefined
+    if (
+      cliServerFastRefresh !== undefined &&
+      configServerFastRefresh !== undefined &&
+      cliServerFastRefresh !== configServerFastRefresh
+    ) {
+      Log.warn(
+        `The CLI flag "${cliServerFastRefresh === false ? '--no-server-fast-refresh' : '--server-fast-refresh'}" conflicts with "experimental.turbopackServerFastRefresh: ${configServerFastRefresh}" in your Next.js config. The CLI flag will take precedence.`
+      )
+      effectiveServerFastRefresh = cliServerFastRefresh
+    } else {
+      // Default to true when neither CLI nor config specifies a value.
+      effectiveServerFastRefresh =
+        cliServerFastRefresh ?? configServerFastRefresh ?? true
+    }
+
+    let developmentBundler = await setupDevBundlerSpan.traceAsyncFn(() =>
       setupDevBundler({
         // Passed here but the initialization of this object happens below, doing the initialization before the setupDev call breaks.
         renderServer,
@@ -119,72 +345,276 @@ export async function initialize(opts: {
         telemetry,
         fsChecker,
         dir: opts.dir,
-        nextConfig: config,
+        nextConfig: developmentConfig,
         isCustomServer: opts.customServer,
         turbo: !!process.env.TURBOPACK,
         port: opts.port,
+        onDevServerCleanup: opts.onDevServerCleanup,
+        resetFetch,
+        serverFastRefresh: effectiveServerFastRefresh,
+        hasVulnerabilityInsight,
       })
     )
 
-    devBundlerService = new DevBundlerService(
+    let devBundlerService = new DevBundlerService(
       developmentBundler,
       // The request handler is assigned below, this allows us to create a lazy
       // reference to it.
       (req, res) => {
         return requestHandlers[opts.dir](req, res)
-      }
+      },
+      Boolean(developmentConfig.experimental.requestInsights)
     )
+
+    development = {
+      bundler: developmentBundler,
+      service: devBundlerService,
+      config: developmentConfig,
+    }
   }
+  const devMemoryThresholdRestart =
+    development?.config.experimental.devMemoryThresholdRestart !== false
 
   renderServer.instance =
     require('./render-server') as typeof import('./render-server')
 
-  const renderServerOpts: Parameters<RenderServer['initialize']>[0] = {
-    port: opts.port,
-    dir: opts.dir,
-    hostname: opts.hostname,
-    minimalMode: opts.minimalMode,
-    dev: !!opts.dev,
-    server: opts.server,
-    isNodeDebugging: !!opts.isNodeDebugging,
-    serverFields: developmentBundler?.serverFields || {},
-    experimentalTestProxy: !!opts.experimentalTestProxy,
-    experimentalHttpsServer: !!opts.experimentalHttpsServer,
-    bundlerService: devBundlerService,
-    startServerSpan: opts.startServerSpan,
-  }
+  const requestHandlerInner: WorkerRequestHandler = async (req, res) => {
+    addRequestMeta(req, 'relativeProjectDir', relativeProjectDir)
+    const assetPrefix = getAssetPrefix()
 
-  // pre-initialize workers
-  const handlers = await renderServer.instance.initialize(renderServerOpts)
-
-  const logError = async (
-    type: 'uncaughtException' | 'unhandledRejection',
-    err: Error | undefined
-  ) => {
-    if (isPostpone(err)) {
-      // React postpones that are unhandled might end up logged here but they're
-      // not really errors. They're just part of rendering.
-      return
+    // internal headers should not be honored by the request handler
+    if (!process.env.NEXT_PRIVATE_TEST_HEADERS) {
+      filterInternalHeaders(req.headers)
     }
-    await developmentBundler?.logErrorWithOriginalStack(err, type)
-  }
 
-  process.on('uncaughtException', logError.bind(null, 'uncaughtException'))
-  process.on('unhandledRejection', logError.bind(null, 'unhandledRejection'))
+    if (opts.dev && req.url) {
+      if (config.experimental.requestInsights) {
+        process.env.__NEXT_REQUEST_INSIGHTS = 'true'
+        filterInvalidDevRequestIdHeaders(req.headers)
+        const identity = resolveRequestInsightsIdentity({
+          previousIdentity: getRequestMeta(req, 'requestInsightsIdentity'),
+          requestIdHeader: req.headers[NEXT_REQUEST_ID_HEADER],
+          htmlRequestIdHeader: req.headers[NEXT_HTML_REQUEST_ID_HEADER],
+          url: req.url,
+          createRequestId: nanoid,
+        })
+        addRequestMeta(req, 'requestInsightsIdentity', identity)
+      }
 
-  const resolveRoutes = getResolveRoutes(
-    fsChecker,
-    config,
-    opts,
-    renderServer.instance,
-    renderServerOpts,
-    developmentBundler?.ensureMiddleware
-  )
+      const urlParts = req.url.split('?', 1)
+      const pathname = removePathPrefix(urlParts[0] || '', config.basePath)
 
-  const requestHandlerImpl: WorkerRequestHandler = async (req, res) => {
+      if (pathname === REQUEST_INSIGHTS_DEV_ENDPOINT) {
+        if (
+          development &&
+          blockCrossSiteDEV(
+            req,
+            res,
+            development.config.allowedDevOrigins,
+            opts.hostname
+          )
+        ) {
+          return
+        }
+
+        res.setHeader('Content-Type', 'application/json; charset=utf-8')
+        res.setHeader('Cache-Control', 'private, no-store')
+        if (
+          !config.experimental.requestInsights &&
+          !isRequestInsightsEnabled()
+        ) {
+          res.statusCode = 404
+          res.end(
+            JSON.stringify({
+              error:
+                'Request Insights is not enabled. Set experimental.requestInsights = true and restart next dev.',
+            })
+          )
+          return
+        }
+
+        const endpointUrl = new URL(req.url, 'http://next.local')
+        const view = endpointUrl.searchParams.get('view')
+        if (process.env.__NEXT_DEV_SERVER) {
+          if (view === 'history') {
+            const liveRequestKeys =
+              endpointUrl.searchParams.getAll('liveRequestKey')
+            if (liveRequestKeys.length > MAX_LIVE_COMPLETED_REQUEST_INSIGHTS) {
+              res.statusCode = 400
+              res.end(
+                JSON.stringify({ error: 'Too many live Request Insights keys' })
+              )
+              return
+            }
+            const filterValues = endpointUrl.searchParams.getAll('filter')
+            const filters = filterValues.filter(
+              (filter): filter is RequestInsightFilter =>
+                REQUEST_INSIGHT_FILTERS.includes(filter as RequestInsightFilter)
+            )
+            if (filters.length !== filterValues.length) {
+              res.statusCode = 400
+              res.end(
+                JSON.stringify({ error: 'Invalid Request Insights filter' })
+              )
+              return
+            }
+            try {
+              const history = await getRequestInsightsHistory({
+                cursor: endpointUrl.searchParams.get('cursor') ?? undefined,
+                filters,
+                liveRequestKeys,
+                limit: parseRequestInsightsHistoryLimit(
+                  endpointUrl.searchParams.get('limit')
+                ),
+                showInternal:
+                  endpointUrl.searchParams.get('showInternal') === '1',
+              })
+              if (!history) {
+                res.statusCode = 503
+                res.end(
+                  JSON.stringify({
+                    error: 'Request Insights history is not ready',
+                  })
+                )
+                return
+              }
+              res.statusCode = 200
+              res.end(JSON.stringify(history))
+            } catch (error) {
+              if (
+                error instanceof Error &&
+                error.name === 'StaleRequestInsightsHistoryCursorError'
+              ) {
+                res.statusCode = 409
+                res.end(
+                  JSON.stringify({ error: 'Request Insights session changed' })
+                )
+                return
+              }
+              throw error
+            }
+            return
+          }
+
+          if (view === 'detail') {
+            const requestId = endpointUrl.searchParams.get('requestId')
+            const kindValue = endpointUrl.searchParams.get('kind')
+            if (
+              kindValue !== null &&
+              kindValue !== 'request' &&
+              kindValue !== 'instant-insights'
+            ) {
+              res.statusCode = 400
+              res.end(JSON.stringify({ error: 'Invalid request kind' }))
+              return
+            }
+            const kind =
+              kindValue === 'instant-insights' ? 'instant-insights' : 'request'
+            if (!requestId || requestId.length > 256) {
+              res.statusCode = 400
+              res.end(
+                JSON.stringify({ error: 'A valid requestId is required' })
+              )
+              return
+            }
+
+            const memoryRequest = getRequestInsightsSnapshot().requests.find(
+              (request) =>
+                request.requestId === requestId && request.kind === kind
+            )
+            if (memoryRequest) {
+              res.statusCode = 200
+              res.end(JSON.stringify({ request: memoryRequest }))
+              return
+            }
+
+            const [request] = await readRequestInsightsHistory({
+              requestId,
+              kind,
+              limit: 1,
+            })
+            res.statusCode = request ? 200 : 404
+            res.end(
+              JSON.stringify(
+                request ? { request } : { error: 'Request insight not found' }
+              )
+            )
+            return
+          }
+        } else if (view === 'history' || view === 'detail') {
+          res.statusCode = 404
+          res.end(JSON.stringify({ error: 'Request Insights is dev-only' }))
+          return
+        }
+
+        res.statusCode = 200
+        res.end(JSON.stringify(getRequestInsightsSnapshot()))
+        return
+      }
+    }
+
+    if (
+      !opts.minimalMode &&
+      config.i18n &&
+      config.i18n.localeDetection !== false
+    ) {
+      const urlParts = (req.url || '').split('?', 1)
+      let urlNoQuery = urlParts[0] || ''
+
+      if (config.basePath) {
+        urlNoQuery = removePathPrefix(urlNoQuery, config.basePath)
+      }
+
+      const pathnameInfo = getNextPathnameInfo(urlNoQuery, {
+        nextConfig: config,
+      })
+
+      const domainLocale = detectDomainLocale(
+        config.i18n.domains,
+        getHostname({ hostname: urlNoQuery }, req.headers)
+      )
+
+      const defaultLocale =
+        domainLocale?.defaultLocale || config.i18n.defaultLocale
+
+      const { getLocaleRedirect } =
+        require('../../shared/lib/i18n/get-locale-redirect') as typeof import('../../shared/lib/i18n/get-locale-redirect')
+
+      const parsedUrl = parseUrlUtil((req.url || '')?.replace(/^\/+/, '/'))
+
+      const redirect = getLocaleRedirect({
+        defaultLocale,
+        domainLocale,
+        headers: req.headers,
+        nextConfig: config,
+        pathLocale: pathnameInfo.locale,
+        urlParsed: {
+          ...parsedUrl,
+          pathname: pathnameInfo.locale
+            ? `/${pathnameInfo.locale}${urlNoQuery}`
+            : urlNoQuery,
+        },
+      })
+
+      if (redirect) {
+        res.setHeader('Location', redirect)
+        res.statusCode = RedirectStatusCode.TemporaryRedirect
+        res.end(redirect)
+        return
+      }
+    }
+
     if (compress) {
       // @ts-expect-error not express req/res
       compress(req, res, () => {})
+
+      // On client disconnect the middleware never ends its zlib stream, which
+      // then leaks past GC. See `releaseCompressionStream`.
+      res.once('close', () => {
+        if (res.writableFinished) return
+
+        releaseCompressionStream(res)
+      })
     }
     req.on('error', (_err) => {
       // TODO: log socket errors?
@@ -199,14 +629,14 @@ export async function initialize(opts: {
       parsedUrl: NextUrlWithParsedQuery,
       invokePath: string,
       handleIndex: number,
-      additionalInvokeHeaders: Record<string, string> = {}
+      additionalRequestMeta?: RequestMeta
     ) {
       // invokeRender expects /api routes to not be locale prefixed
       // so normalize here before continuing
       if (
         config.i18n &&
         removePathPrefix(invokePath, config.basePath).startsWith(
-          `/${parsedUrl.query.__nextLocale}/api`
+          `/${getRequestMeta(req, 'locale')}/api`
         )
       ) {
         invokePath = fsChecker.handleLocale(
@@ -220,7 +650,7 @@ export async function initialize(opts: {
         removePathPrefix(invokePath, config.basePath) === '/404'
       ) {
         res.setHeader('x-nextjs-matched-path', parsedUrl.pathname || '')
-        res.statusCode = 200
+        res.statusCode = 404
         res.setHeader('content-type', 'application/json')
         res.end('{}')
         return null
@@ -230,26 +660,27 @@ export async function initialize(opts: {
         throw new Error('Failed to initialize render server')
       }
 
-      const invokeHeaders: typeof req.headers = {
-        ...req.headers,
-        'x-middleware-invoke': '',
-        'x-invoke-path': invokePath,
-        'x-invoke-query': encodeURIComponent(JSON.stringify(parsedUrl.query)),
-        ...(additionalInvokeHeaders || {}),
-      }
-      Object.assign(req.headers, invokeHeaders)
+      addRequestMeta(req, 'invokePath', invokePath)
+      addRequestMeta(req, 'invokeQuery', parsedUrl.query)
+      addRequestMeta(req, 'middlewareInvoke', false)
 
-      debug('invokeRender', req.url, invokeHeaders)
+      for (const key in additionalRequestMeta || {}) {
+        addRequestMeta(
+          req,
+          key as keyof RequestMeta,
+          additionalRequestMeta![key as keyof RequestMeta]
+        )
+      }
+
+      debug('invokeRender', req.url, req.headers)
 
       try {
-        const initResult = await renderServer?.instance?.initialize(
-          renderServerOpts
-        )
+        const initResult =
+          await renderServer?.instance?.initialize(renderServerOpts)
         try {
           await initResult?.requestHandler(req, res)
         } catch (err) {
           if (err instanceof NoFallbackError) {
-            // eslint-disable-next-line
             await handleRequest(handleIndex + 1)
             return
           }
@@ -273,15 +704,31 @@ export async function initialize(opts: {
       }
 
       // handle hot-reloader first
-      if (developmentBundler) {
+      if (development) {
+        if (
+          blockCrossSiteDEV(
+            req,
+            res,
+            development.config.allowedDevOrigins,
+            opts.hostname
+          )
+        ) {
+          return
+        }
+
         const origUrl = req.url || '/'
 
+        // both the basePath and assetPrefix need to be stripped from the URL
+        // so that the development bundler can find the correct file
         if (config.basePath && pathHasPrefix(origUrl, config.basePath)) {
           req.url = removePathPrefix(origUrl, config.basePath)
+        } else if (assetPrefix && pathHasPrefix(origUrl, assetPrefix)) {
+          req.url = removePathPrefix(origUrl, assetPrefix)
         }
-        const parsedUrl = url.parse(req.url || '/')
 
-        const hotReloaderResult = await developmentBundler.hotReloader.run(
+        const parsedUrl = parseUrlUtil(req.url || '/')
+
+        const hotReloaderResult = await development.bundler.hotReloader.run(
           req,
           res,
           parsedUrl
@@ -290,6 +737,7 @@ export async function initialize(opts: {
         if (hotReloaderResult.finished) {
           return hotReloaderResult
         }
+
         req.url = origUrl
       }
 
@@ -312,19 +760,21 @@ export async function initialize(opts: {
         return
       }
 
-      if (developmentBundler && matchedOutput?.type === 'devVirtualFsItem') {
+      if (development && matchedOutput?.type === 'devVirtualFsItem') {
         const origUrl = req.url || '/'
 
         if (config.basePath && pathHasPrefix(origUrl, config.basePath)) {
           req.url = removePathPrefix(origUrl, config.basePath)
+        } else if (assetPrefix && pathHasPrefix(origUrl, assetPrefix)) {
+          req.url = removePathPrefix(origUrl, assetPrefix)
         }
 
-        if (resHeaders) {
+        if (resHeaders !== null) {
           for (const key of Object.keys(resHeaders)) {
             res.setHeader(key, resHeaders[key])
           }
         }
-        const result = await developmentBundler.requestHandler(req, res)
+        const result = await development.bundler.requestHandler(req, res)
 
         if (result.finished) {
           return
@@ -346,8 +796,10 @@ export async function initialize(opts: {
       })
 
       // apply any response headers from routing
-      for (const key of Object.keys(resHeaders || {})) {
-        res.setHeader(key, resHeaders[key])
+      if (resHeaders !== null) {
+        for (const key of Object.keys(resHeaders)) {
+          res.setHeader(key, resHeaders[key])
+        }
       }
 
       // handle redirect
@@ -386,12 +838,12 @@ export async function initialize(opts: {
             fsChecker.pageFiles.has(matchedOutput.itemPath))
         ) {
           res.statusCode = 500
+          const message = `A conflicting public file and page file was found for path ${matchedOutput.itemPath} https://nextjs.org/docs/messages/conflicting-public-file-page`
           await invokeRender(parsedUrl, '/_error', handleIndex, {
-            'x-invoke-status': '500',
-            'x-invoke-error': JSON.stringify({
-              message: `A conflicting public file and page file was found for path ${matchedOutput.itemPath} https://nextjs.org/docs/messages/conflicting-public-file-page`,
-            }),
+            invokeStatus: 500,
+            invokeError: new Error(message),
           })
+          Log.error(message)
           return
         }
 
@@ -399,8 +851,15 @@ export async function initialize(opts: {
           !res.getHeader('cache-control') &&
           matchedOutput.type === 'nextStaticFolder'
         ) {
-          if (opts.dev && !isNextFont(parsedUrl.pathname)) {
-            res.setHeader('Cache-Control', 'no-store, must-revalidate')
+          if (matchedOutput.itemPath.startsWith('/service-worker/')) {
+            res.setHeader('Cache-Control', 'public, max-age=0, must-revalidate')
+            res.setHeader('Service-Worker-Allowed', config.basePath || '/')
+          } else if (opts.dev && !isNextFont(parsedUrl.pathname)) {
+            // Development assets stay revalidatable. `serveStatic` adds an
+            // `ETag`, so the browser sends a conditional request and reuses the
+            // stored body when the server answers `304`. This keeps the browser
+            // from downloading every chunk again on each page load.
+            res.setHeader('Cache-Control', 'no-cache, must-revalidate')
           } else {
             res.setHeader(
               'Cache-Control',
@@ -411,17 +870,21 @@ export async function initialize(opts: {
         if (!(req.method === 'GET' || req.method === 'HEAD')) {
           res.setHeader('Allow', ['GET', 'HEAD'])
           res.statusCode = 405
-          return await invokeRender(
-            url.parse('/405', true),
-            '/405',
-            handleIndex,
-            {
-              'x-invoke-status': '405',
-            }
-          )
+          return await invokeRender(parseUrlUtil('/405'), '/405', handleIndex, {
+            invokeStatus: 405,
+          })
         }
 
         try {
+          if (config.experimental.requestInsights) {
+            const requestInsightsIdentity = getRequestMeta(
+              req,
+              'requestInsightsIdentity'
+            )
+            if (requestInsightsIdentity) {
+              recordRequestInsightSource(requestInsightsIdentity, 'asset')
+            }
+          }
           return await serveStatic(req, res, matchedOutput.itemPath, {
             root: matchedOutput.itemsRoot,
             // Ensures that etags are not generated for static files when disabled.
@@ -469,19 +932,19 @@ export async function initialize(opts: {
 
           // normalize non-allowed status codes
           if (!validErrorStatus) {
-            ;(err as any).statusCode = 400
+            err.statusCode = 400
           }
 
           if (typeof err.statusCode === 'number') {
             const invokePath = `/${err.statusCode}`
-            const invokeStatus = `${err.statusCode}`
+            const invokeStatus = err.statusCode
             res.statusCode = err.statusCode
             return await invokeRender(
-              url.parse(invokePath, true),
+              parseUrlUtil(invokePath),
               invokePath,
               handleIndex,
               {
-                'x-invoke-status': invokeStatus,
+                invokeStatus,
               }
             )
           }
@@ -492,21 +955,98 @@ export async function initialize(opts: {
       if (matchedOutput) {
         invokedOutputs.add(matchedOutput.itemPath)
 
+        // fsChecker preserves compilation errors from its dev ensure step so
+        // the route remains matched. Log the compiler diagnostic, then render
+        // the matched route as a 500 instead of falling through to a 404.
+        if (matchedOutput.error && development) {
+          development.bundler.logErrorWithOriginalStack(
+            matchedOutput.error,
+            matchedOutput.type === 'appFile' ? 'app-dir' : undefined
+          )
+        }
+
         return await invokeRender(
           parsedUrl,
           parsedUrl.pathname || '/',
           handleIndex,
           {
-            'x-invoke-output': matchedOutput.itemPath,
+            invokeOutput: matchedOutput.itemPath,
+            ...(matchedOutput.didMatchLocalePrefixedPath
+              ? { didMatchLocalePrefixedPath: true }
+              : undefined),
+            ...(matchedOutput.error
+              ? {
+                  invokeStatus: 500,
+                  invokeError: matchedOutput.error,
+                }
+              : undefined),
+            // fsChecker owns the route match for filesystem requests. Forward
+            // it so BaseServer does not need the removed matcher manager.
+            ...(matchedOutput.route
+              ? {
+                  match: {
+                    definition: matchedOutput.route,
+                    params: matchedOutput.params,
+                  },
+                }
+              : undefined),
           }
         )
+      }
+
+      // We want the original pathname without any basePath or proxy rewrites.
+      if (development && isChromeDevtoolsWorkspaceUrl(req.url)) {
+        await handleChromeDevtoolsWorkspaceRequest(res, opts, config)
+        return
       }
 
       // 404 case
       res.setHeader(
         'Cache-Control',
-        'no-cache, no-store, max-age=0, must-revalidate'
+        'private, no-cache, no-store, max-age=0, must-revalidate'
       )
+
+      let realRequestPathname = parsedUrl.pathname ?? ''
+      if (realRequestPathname) {
+        if (config.basePath) {
+          realRequestPathname = removePathPrefix(
+            realRequestPathname,
+            config.basePath
+          )
+        }
+        if (assetPrefix) {
+          realRequestPathname = removePathPrefix(
+            realRequestPathname,
+            assetPrefix
+          )
+        }
+        if (config.i18n) {
+          realRequestPathname = removePathPrefix(
+            realRequestPathname,
+            '/' + (getRequestMeta(req, 'locale') ?? '')
+          )
+        }
+      }
+      // For not found static assets, return plain text 404 instead of
+      // full HTML 404 pages to save bandwidth.
+      if (realRequestPathname.startsWith('/_next/static/')) {
+        res.statusCode = 404
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+        res.end('Not Found')
+        return null
+      }
+
+      // For subresource requests (e.g. images or fonts), return plain text
+      // 404 instead of rendering the not-found route.
+      if (
+        (req.method === 'GET' || req.method === 'HEAD') &&
+        isNonHtmlSecFetchDest(req.headers['sec-fetch-dest'])
+      ) {
+        res.statusCode = 404
+        res.setHeader('Content-Type', 'text/plain; charset=utf-8')
+        res.end('Not Found')
+        return null
+      }
 
       // Short-circuit favicon.ico serving so that the 404 page doesn't get built as favicon is requested by the browser when loading any route.
       if (opts.dev && !matchedOutput && parsedUrl.pathname === '/favicon.ico') {
@@ -516,24 +1056,24 @@ export async function initialize(opts: {
       }
 
       const appNotFound = opts.dev
-        ? developmentBundler?.serverFields.hasAppNotFound
-        : await fsChecker.getItem('/_not-found')
+        ? development?.bundler?.serverFields.hasAppNotFound
+        : await fsChecker.getItem(UNDERSCORE_NOT_FOUND_ROUTE)
 
       res.statusCode = 404
 
       if (appNotFound) {
         return await invokeRender(
           parsedUrl,
-          opts.dev ? '/not-found' : '/_not-found',
+          UNDERSCORE_NOT_FOUND_ROUTE,
           handleIndex,
           {
-            'x-invoke-status': '404',
+            invokeStatus: 404,
           }
         )
       }
 
       await invokeRender(parsedUrl, '/404', handleIndex, {
-        'x-invoke-status': '404',
+        invokeStatus: 404,
       })
     }
 
@@ -547,12 +1087,16 @@ export async function initialize(opts: {
         if (err instanceof DecodeError) {
           invokePath = '/400'
           invokeStatus = '400'
+        } else if (isModuleBuildError(err)) {
+          // Webpack compilation failures may bubble out of invokeRender. Log
+          // the readable diagnostic without printing the wrapper stack again.
+          Log.error(getErrorMessage(err))
         } else {
           console.error(err)
         }
         res.statusCode = Number(invokeStatus)
-        return await invokeRender(url.parse(invokePath, true), invokePath, 0, {
-          'x-invoke-status': invokeStatus,
+        return await invokeRender(parseUrlUtil(invokePath), invokePath, 0, {
+          invokeStatus: res.statusCode,
         })
       } catch (err2) {
         console.error(err2)
@@ -562,17 +1106,116 @@ export async function initialize(opts: {
     }
   }
 
+  const requestHandlerImpl: WorkerRequestHandler = async (req, res) => {
+    try {
+      return await requestHandlerInner(req, res)
+    } finally {
+      if (opts.dev && config.experimental.requestInsights) {
+        const identity = getRequestMeta(req, 'requestInsightsIdentity')
+        if (identity) {
+          void waitForResponseToFinish(res).then(() => {
+            completeRequestInsight(identity)
+          })
+        }
+      }
+    }
+  }
+
   let requestHandler: WorkerRequestHandler = requestHandlerImpl
-  if (opts.experimentalTestProxy) {
+  if (config.experimental.testProxy) {
     // Intercept fetch and other testmode apis.
-    const {
-      wrapRequestHandlerWorker,
-      interceptTestApis,
-    } = require('next/dist/experimental/testmode/server')
+    const { wrapRequestHandlerWorker, interceptTestApis } =
+      // eslint-disable-next-line @next/internal/typechecked-require -- experimental/testmode is not built ins next/dist/esm
+      require('next/dist/experimental/testmode/server') as typeof import('../../experimental/testmode/server')
     requestHandler = wrapRequestHandlerWorker(requestHandler)
     interceptTestApis()
+    // We treat the intercepted fetch as "original" fetch that should be reset to during HMR.
+    originalFetch = globalThis.fetch
   }
   requestHandlers[opts.dir] = requestHandler
+
+  const renderServerOpts: Parameters<RenderServer['initialize']>[0] = {
+    port: opts.port,
+    dir: opts.dir,
+    hostname: opts.hostname,
+    minimalMode: opts.minimalMode,
+    dev: !!opts.dev,
+    server: opts.server,
+    serverFields: {
+      ...(development?.bundler?.serverFields || {}),
+      setIsrStatus: development?.service?.setIsrStatus.bind(
+        development?.service
+      ),
+    } satisfies ServerFields,
+    experimentalTestProxy: !!config.experimental.testProxy,
+    experimentalHttpsServer: !!opts.experimentalHttpsServer,
+    bundlerService: development?.service,
+    startServerSpan: opts.startServerSpan,
+    quiet: opts.quiet,
+    onDevServerCleanup: opts.onDevServerCleanup,
+    distDir: config.distDir,
+    experimentalFeatures,
+    cacheComponents: config.cacheComponents,
+    partialPrefetching: config.partialPrefetching,
+    devMemoryThresholdRestart,
+  }
+  renderServerOpts.serverFields.routerServerHandler = requestHandlerImpl
+
+  // pre-initialize workers
+  const handlers = await renderServer.instance.initialize(renderServerOpts)
+  const getAssetPrefix = () => handlers.server.getAssetPrefix()
+
+  // this must come after initialize of render server since it's
+  // using initialized methods
+  if (!routerServerGlobal[RouterServerContextSymbol]) {
+    routerServerGlobal[RouterServerContextSymbol] = {}
+  }
+  const relativeProjectDir = path.relative(process.cwd(), opts.dir)
+
+  routerServerGlobal[RouterServerContextSymbol][relativeProjectDir] = {
+    nextConfig: getNextConfigRuntime(config),
+    getAssetPrefix,
+    hostname: handlers.server.hostname,
+    revalidate: handlers.server.revalidate.bind(handlers.server),
+    render404: handlers.server.render404.bind(handlers.server),
+    experimentalTestProxy: renderServerOpts.experimentalTestProxy,
+    logErrorWithOriginalStack: opts.dev
+      ? handlers.server.logErrorWithOriginalStack.bind(handlers.server)
+      : (err: unknown) => !opts.quiet && Log.error(err),
+    setCacheStatus: config.cacheComponents
+      ? development?.service?.setCacheStatus.bind(development?.service)
+      : undefined,
+    setIsrStatus: development?.service?.setIsrStatus.bind(development?.service),
+    setReactDebugChannel: development?.config.experimental.reactDebugChannel
+      ? development?.service?.setReactDebugChannel.bind(development?.service)
+      : undefined,
+    sendErrorsToBrowser: development?.service?.sendErrorsToBrowser.bind(
+      development?.service
+    ),
+  }
+
+  const logError = async (err: Error | undefined) => {
+    Log.error('uncaughtException: ', err)
+  }
+
+  process.on('uncaughtException', logError)
+
+  // The render server may run in the same process and have already registered
+  // the unhandled rejection listener, in which case we must not register
+  // another one, to avoid logging unhandled rejections multiple times.
+  if (!isUnhandledRejectionListenerRegistered()) {
+    registerUnhandledRejectionListener()
+  }
+
+  const resolveRoutes = getResolveRoutes(
+    fsChecker,
+    config,
+    getAssetPrefix,
+    opts,
+    renderServer.instance,
+    renderServerOpts,
+    development?.bundler?.ensureMiddleware
+  )
 
   const upgradeHandler: WorkerUpgradeHandler = async (req, socket, head) => {
     try {
@@ -585,26 +1228,80 @@ export async function initialize(opts: {
         // console.error(_err);
       })
 
-      if (opts.dev && developmentBundler && req.url) {
-        const { basePath, assetPrefix } = config
+      if (opts.dev && development && req.url) {
+        if (
+          blockCrossSiteDEV(
+            req,
+            socket,
+            development.config.allowedDevOrigins,
+            opts.hostname
+          )
+        ) {
+          return
+        }
+        const { basePath } = config
+        const assetPrefix = getAssetPrefix()
+
+        let hmrPrefix = basePath
+
+        // assetPrefix overrides basePath for HMR path
+        if (assetPrefix) {
+          hmrPrefix = normalizedAssetPrefix(assetPrefix)
+
+          if (URL.canParse(hmrPrefix)) {
+            // remove trailing slash from pathname
+            // return empty string if pathname is '/'
+            // to avoid conflicts with '/_next' below
+            hmrPrefix = new URL(hmrPrefix).pathname.replace(/\/$/, '')
+          }
+        }
 
         const isHMRRequest = req.url.startsWith(
-          ensureLeadingSlash(`${assetPrefix || basePath}/_next/webpack-hmr`)
+          ensureLeadingSlash(`${hmrPrefix}/_next/hmr`)
         )
 
         // only handle HMR requests if the basePath in the request
         // matches the basePath for the handler responding to the request
         if (isHMRRequest) {
-          return developmentBundler.hotReloader.onHMR(req, socket, head)
+          return development.bundler.hotReloader.onHMR(
+            req,
+            socket,
+            head,
+            (client, { isLegacyClient }) => {
+              if (isLegacyClient) {
+                // Only send the ISR manifest to legacy clients, i.e. Pages
+                // Router clients, or App Router clients that have Cache
+                // Components disabled. The ISR manifest is only used to inform
+                // the static indicator, which currently does not provide useful
+                // information if Cache Components is enabled due to its binary
+                // nature (i.e. it does not support showing info for partially
+                // static pages).
+                client.send(
+                  JSON.stringify({
+                    type: HMR_MESSAGE_SENT_TO_BROWSER.ISR_MANIFEST,
+                    data: development.service?.appIsrManifest || {},
+                  } satisfies AppIsrManifestMessage)
+                )
+              }
+            }
+          )
         }
       }
 
-      const { matchedOutput, parsedUrl } = await resolveRoutes({
-        req,
-        res: socket as any,
-        isUpgradeReq: true,
-        signal: signalFromNodeResponse(socket),
+      const res = new MockedResponse({
+        resWriter: () => {
+          throw new Error(
+            'Invariant: did not expect response writer to be written to for upgrade request'
+          )
+        },
       })
+      const { finished, matchedOutput, parsedUrl, statusCode } =
+        await resolveRoutes({
+          req,
+          res,
+          isUpgradeReq: true,
+          signal: signalFromNodeResponse(socket),
+        })
 
       // TODO: allow upgrade requests to pages/app paths?
       // this was not previously supported
@@ -612,8 +1309,12 @@ export async function initialize(opts: {
         return socket.end()
       }
 
-      if (parsedUrl.protocol) {
-        return await proxyRequest(req, socket as any, parsedUrl, head)
+      if (finished && parsedUrl.protocol) {
+        if (!statusCode) {
+          return await proxyRequest(req, socket, parsedUrl, head)
+        }
+
+        return socket.end()
       }
 
       // If there's no matched output, we don't handle the request as user's
@@ -624,5 +1325,22 @@ export async function initialize(opts: {
     }
   }
 
-  return [requestHandler, upgradeHandler]
+  return {
+    requestHandler,
+    upgradeHandler,
+    server: handlers.server,
+    closeUpgraded() {
+      development?.bundler?.hotReloader?.close()
+    },
+    distDir: config.distDir,
+    experimentalFeatures,
+    cacheComponents: config.cacheComponents,
+    partialPrefetching: config.partialPrefetching,
+    agentRules: config.agentRules,
+    agentFeedback: config.experimental.agentFeedback,
+    agentUpgrade: development
+      ? development.config.experimental.agentUpgrade !== false
+      : undefined,
+    devMemoryThresholdRestart,
+  }
 }

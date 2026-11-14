@@ -1,25 +1,23 @@
-import { createNextDescribe } from 'e2e-utils'
+import { nextTestSetup } from 'e2e-utils'
 
 const GENERIC_RSC_ERROR =
-  'An error occurred in the Server Components render. The specific message is omitted in production builds to avoid leaking sensitive details. A digest property is included on this error instance which may provide additional details about the nature of the error.'
+  'Minified React error #441; visit https://react.dev/errors/441 for the full message or use the non-minified dev environment for full errors and additional helpful warnings.'
 
 export function runTest({ next, isNextDev }) {
   it('should error when passing process env to client component', async () => {
     const browser = await next.browser('/')
     expect(await browser.waitForElementByCss('#error-component').text()).toBe(
       isNextDev
-        ? 'Do not pass process.env to client components since it will leak sensitive data'
+        ? 'Do not pass process.env to Client Components since it will leak sensitive data'
         : GENERIC_RSC_ERROR
     )
   })
 }
 
-createNextDescribe(
-  'app dir - taint',
-  {
+describe('app dir - taint', () => {
+  const { next, isNextDev } = nextTestSetup({
     files: __dirname,
-  },
-  ({ next, isNextDev }) => {
-    runTest({ next, isNextDev })
-  }
-)
+  })
+
+  runTest({ next, isNextDev })
+})

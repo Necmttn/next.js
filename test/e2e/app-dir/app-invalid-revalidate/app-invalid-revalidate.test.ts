@@ -1,100 +1,38 @@
-import { createNextDescribe } from 'e2e-utils'
-import { check } from 'next-test-utils'
+import { nextTestSetup } from 'e2e-utils'
+import { retry } from 'next-test-utils'
+import path from 'path'
 
-createNextDescribe(
-  'app-invalid-revalidate',
-  {
-    files: __dirname,
-    skipStart: true,
-    skipDeployment: true,
-  },
-  ({ next, isNextDev }) => {
-    it('should error properly for invalid revalidate at layout', async () => {
-      await next.stop().catch(() => {})
-      const origText = await next.readFile('app/layout.tsx')
-
-      try {
-        await next.patchFile(
-          'app/layout.tsx',
-          origText.replace('// export', 'export')
-        )
-        await next.start().catch(() => {})
-
-        await check(async () => {
-          if (isNextDev) {
-            await next.fetch('/')
-          }
-          return next.cliOutput
-        }, /Invalid revalidate value "1" on "\/", must be a non-negative number or "false"/)
-      } finally {
-        await next.patchFile('app/layout.tsx', origText)
-      }
+describe.each(['layout', 'page', 'fetch', 'unstable-cache'])(
+  'app-invalid-revalidate (%s)',
+  (fixture) => {
+    const { next, isNextDev } = nextTestSetup({
+      files: path.join(__dirname, 'fixtures', fixture),
+      skipStart: true,
+      nextConfig: {
+        typescript: {
+          ignoreBuildErrors: true,
+        },
+        experimental: {
+          prerenderEarlyExit: false,
+        },
+      },
     })
 
-    it('should error properly for invalid revalidate at page', async () => {
-      await next.stop().catch(() => {})
-      const origText = await next.readFile('app/page.tsx')
-
-      try {
-        await next.patchFile(
-          'app/page.tsx',
-          origText.replace('// export', 'export')
-        )
-        await next.start().catch(() => {})
-
-        await check(async () => {
-          if (isNextDev) {
-            await next.fetch('/')
-          }
-          return next.cliOutput
-        }, /Invalid revalidate value "1" on "\/", must be a non-negative number or "false"/)
-      } finally {
-        await next.patchFile('app/page.tsx', origText)
+    it('reports the invalid revalidate value', async () => {
+      if (isNextDev) {
+        await next.start()
+        await next.fetch('/')
+      } else {
+        await expect(next.start()).rejects.toThrow()
       }
-    })
 
-    it('should error properly for invalid revalidate on fetch', async () => {
-      await next.stop().catch(() => {})
-      const origText = await next.readFile('app/page.tsx')
-
-      try {
-        await next.patchFile(
-          'app/page.tsx',
-          origText.replace('// await', 'await')
+      await retry(() => {
+        expect(next.cliOutput).toMatch(
+          fixture === 'unstable-cache'
+            ? /Invalid revalidate value "1" on "unstable_cache/
+            : /Invalid revalidate value "1" on "\/", must be a non-negative number or false/
         )
-        await next.start().catch(() => {})
-
-        await check(async () => {
-          if (isNextDev) {
-            await next.fetch('/')
-          }
-          return next.cliOutput
-        }, /Invalid revalidate value "1" on "\/", must be a non-negative number or "false"/)
-      } finally {
-        await next.patchFile('app/page.tsx', origText)
-      }
-    })
-
-    it('should error properly for invalid revalidate on unstable_cache', async () => {
-      await next.stop().catch(() => {})
-      const origText = await next.readFile('app/page.tsx')
-
-      try {
-        await next.patchFile(
-          'app/page.tsx',
-          origText.replace('// await unstable', 'await unstable')
-        )
-        await next.start().catch(() => {})
-
-        await check(async () => {
-          if (isNextDev) {
-            await next.fetch('/')
-          }
-          return next.cliOutput
-        }, /Invalid revalidate value "1" on "unstable_cache/)
-      } finally {
-        await next.patchFile('app/page.tsx', origText)
-      }
-    })
+      })
+    }, 240_000) // This test includes the build/deployment, not just runtime assertions.
   }
 )

@@ -1,21 +1,31 @@
-import type { NextRequest } from './spec-extension/request'
 import type {
   AppRouteRouteHandlerContext,
   AppRouteRouteModule,
-} from '../future/route-modules/app-route/module'
-import type { PrerenderManifest } from '../../build'
+} from '../route-modules/app-route/module'
 
 import './globals'
 
-import { adapter, type AdapterOptions } from './adapter'
-import { IncrementalCache } from '../lib/incremental-cache'
-import { RouteMatcher } from '../future/route-matchers/route-matcher'
+import { adapter, type NextRequestHint, type EdgeHandler } from './adapter'
+import {
+  IncrementalCache,
+  type CacheHandler as IncrementalCacheHandler,
+} from '../lib/incremental-cache'
+import type { CacheHandler } from '../lib/cache-handlers/types'
+import { initializeCacheHandlers, setCacheHandler } from '../use-cache/handlers'
 import type { NextFetchEvent } from './spec-extension/fetch-event'
 import { internal_getCurrentFunctionWaitUntil } from './internal-edge-wait-until'
-import { getUtils } from '../server-utils'
+import { getServerUtils } from '../server-utils'
 import { searchParamsToUrlQuery } from '../../shared/lib/router/utils/querystring'
+import { CloseController, trackStreamConsumed } from './web-on-close'
+import { getEdgePreviewProps } from './get-edge-preview-props'
+import { WebNextRequest } from '../../server/base-http/web'
+import { isDynamicRoute } from '../../shared/lib/router/utils'
 
-type WrapOptions = Partial<Pick<AdapterOptions, 'page'>>
+export interface WrapOptions {
+  page: string
+  cacheHandlers?: Record<string, CacheHandler>
+  incrementalCacheHandler?: typeof IncrementalCacheHandler
+}
 
 /**
  * EdgeRouteModuleWrapper is a wrapper around a route module.
@@ -23,7 +33,7 @@ type WrapOptions = Partial<Pick<AdapterOptions, 'page'>>
  * Note that this class should only be used in the edge runtime.
  */
 export class EdgeRouteModuleWrapper {
-  private readonly matcher: RouteMatcher
+  private readonly pageIsDynamic: boolean
 
   /**
    * The constructor is wrapped with private to ensure that it can only be
@@ -31,9 +41,11 @@ export class EdgeRouteModuleWrapper {
    *
    * @param routeModule the route module to wrap
    */
-  private constructor(private readonly routeModule: AppRouteRouteModule) {
-    // TODO: (wyattjoh) possibly allow the module to define it's own matcher
-    this.matcher = new RouteMatcher(routeModule.definition)
+  private constructor(
+    private readonly routeModule: AppRouteRouteModule,
+    private readonly cacheHandlers: Record<string, CacheHandler>
+  ) {
+    this.pageIsDynamic = isDynamicRoute(routeModule.definition.pathname)
   }
 
   /**
@@ -47,30 +59,34 @@ export class EdgeRouteModuleWrapper {
    */
   public static wrap(
     routeModule: AppRouteRouteModule,
-    options: WrapOptions = {}
-  ) {
+    options: WrapOptions
+  ): EdgeHandler {
     // Create the module wrapper.
-    const wrapper = new EdgeRouteModuleWrapper(routeModule)
+    const wrapper = new EdgeRouteModuleWrapper(
+      routeModule,
+      options.cacheHandlers ?? {}
+    )
 
     // Return the wrapping function.
-    return (opts: AdapterOptions) => {
+    return (opts) => {
       return adapter({
         ...opts,
-        ...options,
         IncrementalCache,
+        incrementalCacheHandler: options.incrementalCacheHandler,
         // Bind the handler method to the wrapper so it still has context.
         handler: wrapper.handler.bind(wrapper),
+        page: options.page,
       })
     }
   }
 
   private async handler(
-    request: NextRequest,
+    request: NextRequestHint,
     evt: NextFetchEvent
   ): Promise<Response> {
-    const utils = getUtils({
-      pageIsDynamic: this.matcher.isDynamic,
-      page: this.matcher.definition.pathname,
+    const utils = getServerUtils({
+      pageIsDynamic: this.pageIsDynamic,
+      page: this.routeModule.definition.pathname,
       basePath: request.nextUrl.basePath,
       // We don't need the `handleRewrite` util, so can just pass an empty object
       rewrites: {},
@@ -78,45 +94,89 @@ export class EdgeRouteModuleWrapper {
       caseSensitive: false,
     })
 
+    const { nextConfig } = this.routeModule.getNextConfigEdge(
+      new WebNextRequest(request)
+    )
+    initializeCacheHandlers(nextConfig.cacheMaxMemorySize)
+    for (const [kind, cacheHandler] of Object.entries(this.cacheHandlers)) {
+      setCacheHandler(kind, cacheHandler)
+    }
+
     const { params } = utils.normalizeDynamicRouteParams(
-      searchParamsToUrlQuery(request.nextUrl.searchParams)
+      searchParamsToUrlQuery(request.nextUrl.searchParams),
+      false
     )
 
-    const prerenderManifest: PrerenderManifest | undefined =
-      typeof self.__PRERENDER_MANIFEST === 'string'
-        ? JSON.parse(self.__PRERENDER_MANIFEST)
-        : undefined
+    const waitUntil = evt.waitUntil.bind(evt)
+    const closeController = new CloseController()
+
+    const previewProps = getEdgePreviewProps()
 
     // Create the context for the handler. This contains the params from the
     // match (if any).
     const context: AppRouteRouteHandlerContext = {
       params,
-      prerenderManifest: {
-        version: 4,
-        routes: {},
-        dynamicRoutes: {},
-        preview: prerenderManifest?.preview || {
-          previewModeEncryptionKey: '',
-          previewModeId: 'development-id',
-          previewModeSigningKey: '',
-        },
-        notFoundRoutes: [],
-      },
+      previewProps,
       renderOpts: {
-        supportsDynamicHTML: true,
-        // App Route's cannot be postponed.
-        experimental: { ppr: false },
+        waitUntil,
+        onClose: closeController.onClose.bind(closeController),
+        onAfterTaskError: undefined,
+        cacheComponents: !!process.env.__NEXT_CACHE_COMPONENTS,
+        // Edge runtime doesn't run instant validation; the level value is
+        // irrelevant here.
+        // TODO: Remove validationLevel and other global config from renderOpts
+        validationLevel: 'warning',
+        experimental: {
+          authInterrupts: !!process.env.__NEXT_EXPERIMENTAL_AUTH_INTERRUPTS,
+          // Edge runtime doesn't support Cache Components, so this value is
+          // never read. 0 is a sentinel: if something ever reads it, the cache
+          // fill will time out immediately and surface the bug.
+          useCacheTimeout: 0,
+          durableUseCacheEntries: false,
+        },
+        cacheLifeProfiles: nextConfig.cacheLife,
+        // Edge runtime doesn't do static generation, so this value does not
+        // apply here. 0 is a sentinel: if something ever reads it, it'll
+        // surface loudly instead of silently using a misleading default.
+        staticPageGenerationTimeout: 0,
+      },
+      sharedContext: {
+        buildId: '', // TODO: Populate this properly.
+        deploymentId: '', // TODO: Populate this properly.
       },
     }
 
     // Get the response from the handler.
-    const res = await this.routeModule.handle(request, context)
+    let res: Response
+    try {
+      res = await this.routeModule.handle(request, context)
+    } catch (error) {
+      closeController.dispatchClose()
+      throw error
+    }
 
     const waitUntilPromises = [internal_getCurrentFunctionWaitUntil()]
-    if (context.renderOpts.waitUntil) {
-      waitUntilPromises.push(context.renderOpts.waitUntil)
+    if (context.renderOpts.pendingWaitUntil) {
+      waitUntilPromises.push(context.renderOpts.pendingWaitUntil)
     }
     evt.waitUntil(Promise.all(waitUntilPromises))
+
+    if (!res.body) {
+      // we can delay running it until a bit later --
+      // if it's needed, we'll have a `waitUntil` lock anyway.
+      setTimeout(() => closeController.dispatchClose(), 0)
+    } else {
+      // NOTE: if this is a streaming response, onClose may be called later,
+      // so we can't rely on `closeController.listeners` -- it might be 0 at this point.
+      const trackedBody = trackStreamConsumed(res.body, () =>
+        closeController.dispatchClose()
+      )
+      res = new Response(trackedBody, {
+        status: res.status,
+        statusText: res.statusText,
+        headers: res.headers,
+      })
+    }
 
     return res
   }

@@ -1,9 +1,11 @@
 // This file should be opted into the react-server layer
 
+// eslint-disable-next-line import/no-extraneous-dependencies
 export {
+  createTemporaryReferenceSet,
+  renderToPipeableStream,
   decodeReply,
   decodeReplyFromBusboy,
   decodeAction,
   decodeFormState,
-  // eslint-disable-next-line import/no-extraneous-dependencies
 } from 'react-server-dom-webpack/server.node'

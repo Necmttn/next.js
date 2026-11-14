@@ -1,6 +1,15 @@
-import { createNextDescribe } from 'e2e-utils'
+import { nextTestSetup } from 'e2e-utils'
+import { fetchViaRawHttp } from 'next-test-utils'
 
-createNextDescribe('x-forwarded-headers', { files: __dirname }, ({ next }) => {
+// Deploy mode exclusion: The assertions exercise behavior specific to the local Next.js server.
+// This test is skipped because it sends requests with manipulated host headers
+// which doesn't work in a deployed environment
+// @force-gate !deploy
+describe('x-forwarded-headers', () => {
+  const { next } = nextTestSetup({
+    files: __dirname,
+  })
+
   it('should include x-forwarded-* headers', async () => {
     const res = await next.fetch('/')
     const headers = await res.json()
@@ -22,7 +31,9 @@ createNextDescribe('x-forwarded-headers', { files: __dirname }, ({ next }) => {
       const reqHeaders = {
         host: `subdomain.localhost:${url.port}`,
       }
-      const res = await next.fetch('/', {
+      // Global fetch derives the Host header from the URL authority and
+      // cannot override it, so this uses a raw HTTP request.
+      const res = await fetchViaRawHttp(next.appPort, '/', {
         headers: reqHeaders,
       })
       const headers = await res.json()
@@ -46,7 +57,7 @@ createNextDescribe('x-forwarded-headers', { files: __dirname }, ({ next }) => {
         port: '1234',
         proto: 'https',
       }
-      const res = await next.fetch('/', {
+      const res = await fetchViaRawHttp(next.appPort, '/', {
         headers: {
           host: 'override.localhost',
           'x-forwarded-host': reqHeaders.host,
@@ -62,6 +73,17 @@ createNextDescribe('x-forwarded-headers', { files: __dirname }, ({ next }) => {
       expect(headers['middleware-x-forwarded-host']).toBe(reqHeaders.host)
       expect(headers['middleware-x-forwarded-port']).toBe(reqHeaders.port)
       expect(headers['middleware-x-forwarded-proto']).toBe(reqHeaders.proto)
+    })
+
+    it('should work with multiple x-forwarded-* headers', async () => {
+      const res = await next.fetch('/', {
+        headers: { 'x-forwarded-proto': 'https, https' },
+      })
+
+      expect(res.status).toBe(200)
+
+      const headers = await res.json()
+      expect(headers['x-forwarded-proto']).toBe('https, https')
     })
   })
 })

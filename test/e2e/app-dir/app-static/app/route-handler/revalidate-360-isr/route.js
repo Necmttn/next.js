@@ -1,12 +1,14 @@
 import { NextResponse } from 'next/server'
 
+export const revalidate = 10
+
 export async function GET() {
   const data360 = await fetch(
     'https://next-data-api-endpoint.vercel.app/api/random',
     {
       next: {
         revalidate: 360,
-        tags: ['thankyounext'],
+        tags: ['app-static:thankyounext'],
       },
     }
   ).then((res) => res.text())
@@ -16,7 +18,7 @@ export async function GET() {
     {
       next: {
         revalidate: 10,
-        tags: ['thankyounext'],
+        tags: ['app-static:thankyounext'],
       },
     }
   ).then((res) => res.text())

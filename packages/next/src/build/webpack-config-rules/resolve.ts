@@ -3,22 +3,12 @@ import {
   type CompilerNameValues,
 } from '../../shared/lib/constants'
 
-// exports.<conditionName>
-export const edgeConditionNames = [
-  'edge-light',
-  'worker',
-  // inherits the default conditions
-  '...',
-]
+export const edgeConditionName = 'edge-light'
 
-const mainFieldsPerCompiler: Record<
-  CompilerNameValues | 'server-esm',
-  string[]
-> = {
+const mainFieldsPerCompiler = {
   // For default case, prefer CJS over ESM on server side. e.g. pages dir SSR
   [COMPILER_NAMES.server]: ['main', 'module'],
   [COMPILER_NAMES.client]: ['browser', 'module', 'main'],
-  [COMPILER_NAMES.edgeServer]: edgeConditionNames,
   // For bundling-all strategy, prefer ESM over CJS
   'server-esm': ['module', 'main'],
 }
@@ -28,7 +18,7 @@ export function getMainField(
   preferEsm: boolean
 ) {
   if (compilerType === COMPILER_NAMES.edgeServer) {
-    return edgeConditionNames
+    return ['edge-light', '...']
   } else if (compilerType === COMPILER_NAMES.client) {
     return mainFieldsPerCompiler[COMPILER_NAMES.client]
   }

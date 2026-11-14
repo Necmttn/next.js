@@ -1,8 +1,6 @@
-import type { IncomingMessage } from 'http'
+import type { IncomingHttpHeaders } from 'http'
 import type { ReadonlyRequestCookies } from '../web/spec-extension/adapters/request-cookies'
 import type { ResponseCookies } from '../web/spec-extension/cookies'
-import type { BaseNextRequest } from '../base-http'
-import type { NextRequest } from '../web/spec-extension/request'
 
 import {
   COOKIE_NAME_PRERENDER_BYPASS,
@@ -11,7 +9,10 @@ import {
 import type { __ApiPreviewProps } from '../api-utils'
 
 export class DraftModeProvider {
-  public readonly isEnabled: boolean
+  /**
+   * @internal - this declaration is stripped via `tsc --stripInternal`
+   */
+  private _isEnabled: boolean
 
   /**
    * @internal - this declaration is stripped via `tsc --stripInternal`
@@ -25,7 +26,7 @@ export class DraftModeProvider {
 
   constructor(
     previewProps: __ApiPreviewProps | undefined,
-    req: IncomingMessage | BaseNextRequest<unknown> | NextRequest,
+    headers: Headers | IncomingHttpHeaders,
     cookies: ReadonlyRequestCookies,
     mutableCookies: ResponseCookies
   ) {
@@ -33,19 +34,26 @@ export class DraftModeProvider {
     // but Draft Mode does not have any data associated with it.
     const isOnDemandRevalidate =
       previewProps &&
-      checkIsOnDemandRevalidate(req, previewProps).isOnDemandRevalidate
+      checkIsOnDemandRevalidate(headers, previewProps).isOnDemandRevalidate
 
     const cookieValue = cookies.get(COOKIE_NAME_PRERENDER_BYPASS)?.value
 
-    this.isEnabled = Boolean(
+    this._isEnabled = Boolean(
       !isOnDemandRevalidate &&
         cookieValue &&
         previewProps &&
-        cookieValue === previewProps.previewModeId
+        (cookieValue === previewProps.previewModeId ||
+          // In dev mode, the cookie can be actual hash value preview id but the preview props can still be `development-id`.
+          (process.env.NODE_ENV !== 'production' &&
+            previewProps.previewModeId === 'development-id'))
     )
 
     this._previewModeId = previewProps?.previewModeId
     this._mutableCookies = mutableCookies
+  }
+
+  get isEnabled() {
+    return this._isEnabled
   }
 
   enable() {
@@ -63,6 +71,8 @@ export class DraftModeProvider {
       secure: process.env.NODE_ENV !== 'development',
       path: '/',
     })
+
+    this._isEnabled = true
   }
 
   disable() {
@@ -78,5 +88,7 @@ export class DraftModeProvider {
       path: '/',
       expires: new Date(0),
     })
+
+    this._isEnabled = false
   }
 }

@@ -2,6 +2,8 @@ import { reporter } from './report'
 import type { SpanId, TraceEvent, TraceState } from './types'
 
 const NUM_OF_MICROSEC_IN_NANOSEC = BigInt('1000')
+const NUM_OF_MILLISEC_IN_NANOSEC = BigInt('1000000')
+
 let count = 0
 const getId = () => {
   count++
@@ -11,22 +13,25 @@ let defaultParentSpanId: SpanId | undefined
 let shouldSaveTraceEvents: boolean | undefined
 let savedTraceEvents: TraceEvent[] = []
 
+const RECORD_SPAN_THRESHOLD_MS = parseInt(
+  process.env.NEXT_TRACE_SPAN_THRESHOLD_MS ?? '-1'
+)
+
 // eslint typescript has a bug with TS enums
-/* eslint-disable no-shadow */
 export enum SpanStatus {
   Started = 'started',
   Stopped = 'stopped',
 }
 
 interface Attributes {
-  [key: string]: string
+  [key: string]: unknown
 }
 
 export class Span {
   private name: string
   private id: SpanId
   private parentId?: SpanId
-  private attrs: { [key: string]: any }
+  private attrs: { [key: string]: unknown }
   private status: SpanStatus
   private now: number
 
@@ -38,19 +43,19 @@ export class Span {
     parentId,
     attrs,
     startTime,
+    wallStartTimeMs,
   }: {
     name: string
     parentId?: SpanId
     startTime?: bigint
+    // Wall-clock start time in milliseconds since epoch, matching `startTime`.
+    // Defaults to the construction time.
+    wallStartTimeMs?: number
     attrs?: Attributes
   }) {
     this.name = name
     this.parentId = parentId ?? defaultParentSpanId
     this.attrs = attrs ? { ...attrs } : {}
-    if (this.parentId === undefined) {
-      // Attach additional information to root spans
-      this.attrs.isTurbopack = Boolean(process.env.TURBOPACK)
-    }
 
     this.status = SpanStatus.Started
     this.id = getId()
@@ -60,7 +65,7 @@ export class Span {
     // `These times are relative to an arbitrary time in the past, and not related to the time of day and therefore not subject to clock drift`
     // https://nodejs.org/api/process.html#processhrtimetime
     // Capturing current datetime as additional metadata for external reconstruction.
-    this.now = Date.now()
+    this.now = wallStartTimeMs ?? Date.now()
   }
 
   // Durations are reported as microseconds. This gives 1000x the precision
@@ -89,9 +94,11 @@ export class Span {
       tags: this.attrs,
       startTime: this.now,
     }
-    reporter.report(traceEvent)
-    if (shouldSaveTraceEvents) {
-      savedTraceEvents.push(traceEvent)
+    if (duration > RECORD_SPAN_THRESHOLD_MS * 1000) {
+      reporter.report(traceEvent)
+      if (shouldSaveTraceEvents) {
+        savedTraceEvents.push(traceEvent)
+      }
     }
   }
 
@@ -102,26 +109,43 @@ export class Span {
   manualTraceChild(
     name: string,
     // Start time in nanoseconds since epoch.
-    startTime: bigint,
+    startTime?: bigint,
     // Stop time in nanoseconds since epoch.
-    stopTime: bigint,
+    stopTime?: bigint,
     attrs?: Attributes
   ) {
-    const span = new Span({ name, parentId: this.id, attrs, startTime })
-    span.stop(stopTime)
+    // We need to convert the time info to the same base as hrtime since that is used usually.
+    const correction =
+      process.hrtime.bigint() - BigInt(Date.now()) * NUM_OF_MILLISEC_IN_NANOSEC
+    const span = new Span({
+      name,
+      parentId: this.id,
+      attrs,
+      startTime: startTime ? startTime + correction : process.hrtime.bigint(),
+      // The span is constructed when the event is recorded, which may be long
+      // after the work started (e.g. compilation events forwarded from
+      // Turbopack), so derive the wall-clock start from the given epoch time.
+      wallStartTimeMs: startTime
+        ? Number(startTime / NUM_OF_MILLISEC_IN_NANOSEC)
+        : undefined,
+    })
+    span.stop(stopTime ? stopTime + correction : process.hrtime.bigint())
   }
 
   getId() {
     return this.id
   }
 
-  setAttribute(key: string, value: string) {
+  setAttribute(key: string, value: unknown) {
     this.attrs[key] = value
   }
 
   traceFn<T>(fn: (span: Span) => T): T {
     try {
       return fn(this)
+    } catch (e) {
+      this.attrs['failed'] = true
+      throw e
     } finally {
       this.stop()
     }
@@ -130,6 +154,9 @@ export class Span {
   async traceAsyncFn<T>(fn: (span: Span) => T | Promise<T>): Promise<T> {
     try {
       return await fn(this)
+    } catch (e) {
+      this.attrs['failed'] = true
+      throw e
     } finally {
       this.stop()
     }
@@ -139,12 +166,18 @@ export class Span {
 export const trace = (
   name: string,
   parentId?: SpanId,
-  attrs?: { [key: string]: string }
+  attrs?: { [key: string]: unknown }
 ) => {
   return new Span({ name, parentId, attrs })
 }
 
 export const flushAllTraces = () => reporter.flushAll()
+
+/**
+ * Flush and release the trace file handle. Intended for tests that need to
+ * delete the directory holding the trace afterwards.
+ */
+export const closeAllTraces = () => reporter.close()
 
 // This code supports workers by serializing the state of tracers when the
 // worker is initialized, and serializing the trace events from the worker back
@@ -177,3 +210,18 @@ export function recordTraceEvents(events: TraceEvent[]) {
 }
 
 export const clearTraceEvents = () => (savedTraceEvents = [])
+
+/**
+ * Converts hrtime (process.hrtime.bigint()) to epoch-based nanoseconds.
+ *
+ * hrtime values are relative to an arbitrary point in the past, while
+ * epoch-based times are nanoseconds since Unix epoch (Jan 1, 1970).
+ *
+ * This is useful when passing hrtime values to APIs that expect epoch-based times,
+ * such as Span.manualTraceChild().
+ */
+export function hrtimeToEpochNanoseconds(hrtimeValue: bigint): bigint {
+  const offset =
+    BigInt(Date.now()) * NUM_OF_MILLISEC_IN_NANOSEC - process.hrtime.bigint()
+  return hrtimeValue + offset
+}

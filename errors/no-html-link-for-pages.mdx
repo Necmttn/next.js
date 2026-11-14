@@ -42,13 +42,15 @@ function Home() {
 export default Home
 ```
 
+The rule also checks href expressions whose values can be determined statically, including local constants and direct property reads inside inline `.map()` callbacks over static arrays. Use `Link` for internal navigation even when the destination comes from runtime data that the rule cannot check.
+
 ### Options
 
 #### `pagesDir`
 
 This rule can normally locate your `pages` directory automatically.
 
-If you're working in a monorepo, we recommend configuring the [`rootDir`](/docs/pages/building-your-application/configuring/eslint#rootdir) setting in `eslint-plugin-next`, which `pagesDir` will use to locate your `pages` directory.
+If you're working in a monorepo, we recommend configuring the [`rootDir`](/docs/pages/api-reference/config/eslint#specifying-a-root-directory-within-a-monorepo) setting in `eslint-plugin-next`, which `pagesDir` will use to locate your `pages` directory.
 
 In some cases, you may also need to configure this rule directly by providing a `pages` directory. This can be a path or an array of paths.
 

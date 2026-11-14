@@ -1,8 +1,9 @@
-import { createNextDescribe } from 'e2e-utils'
+import { nextTestSetup } from 'e2e-utils'
 
-createNextDescribe(
-  'react-dnd-compile',
-  {
+// TODO(deploy-test-completion): Remove this suite from the deploy manifest.
+// It was excluded as a known deploy failure without a documented root cause.
+describe('react-dnd-compile', () => {
+  const { next } = nextTestSetup({
     files: __dirname,
     dependencies: {
       '@react-dnd/asap': '^5.0.1',
@@ -11,16 +12,15 @@ createNextDescribe(
       'react-dnd': '^16.0.1',
       'react-dnd-html5-backend': '^16.0.1',
     },
-  },
-  ({ next }) => {
-    it('should work', async () => {
-      const $ = await next.render$('/')
-      expect($('#index-page-title').text()).toBe('Hello, Next.js!')
-    })
+  })
 
-    it('should work on react-dnd import page', async () => {
-      const $ = await next.render$('/oom')
-      expect($('#oom-page-title').text()).toBe('Hello, Next.js!')
-    })
-  }
-)
+  it('should work', async () => {
+    const $ = await next.render$('/')
+    expect($('#index-page-title').text()).toBe('Hello, Next.js!')
+  })
+
+  it('should work on react-dnd import page', async () => {
+    const $ = await next.render$('/oom')
+    expect($('#oom-page-title').text()).toBe('Hello, Next.js!')
+  })
+})

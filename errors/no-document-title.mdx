@@ -4,13 +4,13 @@ title: '`<title>` should not be used in _document.js `<Head>`'
 
 ## Why This Error Occurred
 
-Adding `<title>` in `pages/_document.js` will lead to unexpected results with `next/head` since `_document.js` is only rendered on the initial pre-render.
+Adding `<title>` in `pages/_document.js` will lead to unexpected results with `next/head` since `_document.js` is only rendered on the initial prerender.
 
 ## Possible Ways to Fix It
 
 Set `<title>` in `pages/_app.js` instead:
 
-```js filename="pages/_app.js"
+```jsx filename="pages/_app.js"
 import React from 'react'
 import Head from 'next/head'
 

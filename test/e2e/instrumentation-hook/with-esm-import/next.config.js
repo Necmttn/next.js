@@ -1,5 +1,5 @@
 module.exports = {
-  experimental: {
-    instrumentationHook: true,
+  typescript: {
+    ignoreBuildErrors: true,
   },
 }

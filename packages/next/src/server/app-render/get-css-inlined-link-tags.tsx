@@ -1,37 +1,35 @@
-import type { ClientReferenceManifest } from '../../build/webpack/plugins/flight-manifest-plugin'
+import type { CssResource } from '../../build/webpack/plugins/flight-manifest-plugin'
+import { getClientReferenceManifest } from './manifests-singleton'
 
 /**
  * Get external stylesheet link hrefs based on server CSS manifest.
  */
 export function getLinkAndScriptTags(
-  clientReferenceManifest: ClientReferenceManifest,
   filePath: string,
   injectedCSS: Set<string>,
   injectedScripts: Set<string>,
   collectNewImports?: boolean
-): { styles: string[]; scripts: string[] } {
+): { styles: ReadonlySet<CssResource>; scripts: ReadonlySet<string> } {
   const filePathWithoutExt = filePath.replace(/\.[^.]+$/, '')
-  const cssChunks = new Set<string>()
+  const cssChunks = new Set<CssResource>()
   const jsChunks = new Set<string>()
+  const { entryCSSFiles, entryJSFiles } = getClientReferenceManifest()
+  const cssFiles = entryCSSFiles[filePathWithoutExt]
+  const jsFiles = entryJSFiles?.[filePathWithoutExt]
 
-  const entryCSSFiles =
-    clientReferenceManifest.entryCSSFiles[filePathWithoutExt]
-  const entryJSFiles =
-    clientReferenceManifest.entryJSFiles?.[filePathWithoutExt] ?? []
-
-  if (entryCSSFiles) {
-    for (const file of entryCSSFiles) {
-      if (!injectedCSS.has(file)) {
+  if (cssFiles) {
+    for (const css of cssFiles) {
+      if (!injectedCSS.has(css.path)) {
         if (collectNewImports) {
-          injectedCSS.add(file)
+          injectedCSS.add(css.path)
         }
-        cssChunks.add(file)
+        cssChunks.add(css)
       }
     }
   }
 
-  if (entryJSFiles) {
-    for (const file of entryJSFiles) {
+  if (jsFiles) {
+    for (const file of jsFiles) {
       if (!injectedScripts.has(file)) {
         if (collectNewImports) {
           injectedScripts.add(file)
@@ -41,5 +39,5 @@ export function getLinkAndScriptTags(
     }
   }
 
-  return { styles: [...cssChunks], scripts: [...jsChunks] }
+  return { styles: cssChunks, scripts: jsChunks }
 }

@@ -3,7 +3,7 @@ import type { NextApiResponse } from '../../../shared/lib/utils'
 import { checkIsOnDemandRevalidate } from '../.'
 import type { __ApiPreviewProps } from '../.'
 import type { BaseNextRequest, BaseNextResponse } from '../../base-http'
-import type { PreviewData } from 'next/types'
+import type { PreviewData } from '../../../types'
 
 import {
   clearPreviewData,
@@ -17,18 +17,22 @@ import { HeadersAdapter } from '../../web/spec-extension/adapters/headers'
 export function tryGetPreviewData(
   req: IncomingMessage | BaseNextRequest | Request,
   res: ServerResponse | BaseNextResponse,
-  options: __ApiPreviewProps
+  options: __ApiPreviewProps,
+  multiZoneDraftMode: boolean
 ): PreviewData {
   // if an On-Demand revalidation is being done preview mode
   // is disabled
-  if (options && checkIsOnDemandRevalidate(req, options).isOnDemandRevalidate) {
+  if (
+    options &&
+    checkIsOnDemandRevalidate(req.headers, options).isOnDemandRevalidate
+  ) {
     return false
   }
 
   // Read cached preview data if present
   // TODO: use request metadata instead of a symbol
   if (SYMBOL_PREVIEW_DATA in req) {
-    return (req as any)[SYMBOL_PREVIEW_DATA] as any
+    return req[SYMBOL_PREVIEW_DATA] as any
   }
 
   const headers = HeadersAdapter.from(req.headers)
@@ -36,13 +40,15 @@ export function tryGetPreviewData(
 
   const previewModeId = cookies.get(COOKIE_NAME_PRERENDER_BYPASS)?.value
   const tokenPreviewData = cookies.get(COOKIE_NAME_PRERENDER_DATA)?.value
+  const isValidPreviewModeId =
+    previewModeId === options.previewModeId ||
+    // In dev mode, the cookie can be the actual hash value preview id but the
+    // preview props can still be `development-id`.
+    (process.env.NODE_ENV !== 'production' &&
+      options.previewModeId === 'development-id')
 
   // Case: preview mode cookie set but data cookie is not set
-  if (
-    previewModeId &&
-    !tokenPreviewData &&
-    previewModeId === options.previewModeId
-  ) {
+  if (previewModeId && !tokenPreviewData && isValidPreviewModeId) {
     // This is "Draft Mode" which doesn't use
     // previewData, so we return an empty object
     // for backwards compat with "Preview Mode".
@@ -61,13 +67,17 @@ export function tryGetPreviewData(
 
   // Case: one cookie is set, but not the other.
   if (!previewModeId || !tokenPreviewData) {
-    clearPreviewData(res as NextApiResponse)
+    if (!multiZoneDraftMode) {
+      clearPreviewData(res as NextApiResponse)
+    }
     return false
   }
 
   // Case: preview session is for an old build.
   if (previewModeId !== options.previewModeId) {
-    clearPreviewData(res as NextApiResponse)
+    if (!multiZoneDraftMode) {
+      clearPreviewData(res as NextApiResponse)
+    }
     return false
   }
 
@@ -75,11 +85,14 @@ export function tryGetPreviewData(
     data: string
   }
   try {
-    const jsonwebtoken =
-      require('next/dist/compiled/jsonwebtoken') as typeof import('next/dist/compiled/jsonwebtoken')
-    encryptedPreviewData = jsonwebtoken.verify(
-      tokenPreviewData,
-      options.previewModeSigningKey
+    const { createVerifier } =
+      require('next/dist/compiled/fast-jwt') as typeof import('next/dist/compiled/fast-jwt')
+    const verify = createVerifier({
+      key: options.previewModeSigningKey,
+      algorithms: ['HS256'],
+    })
+    encryptedPreviewData = verify(
+      tokenPreviewData
     ) as typeof encryptedPreviewData
   } catch {
     // TODO: warn

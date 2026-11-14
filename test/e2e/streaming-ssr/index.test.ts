@@ -1,6 +1,5 @@
 import { join } from 'path'
-import { createNext, createNextDescribe } from 'e2e-utils'
-import { NextInstance } from 'test/lib/next-modes/base'
+import { nextTestSetup, isNextDev, isNextDeploy } from 'e2e-utils'
 import {
   check,
   fetchViaHTTP,
@@ -10,92 +9,94 @@ import {
   renderViaHTTP,
 } from 'next-test-utils'
 
-const isNextProd = !(global as any).isNextDev && !(global as any).isNextDeploy
+const isNextProd = !isNextDev && !isNextDeploy
 
-createNextDescribe(
-  'streaming SSR with custom next configs',
-  {
+describe('streaming SSR with custom next configs', () => {
+  const { next } = nextTestSetup({
     files: join(__dirname, 'streaming-ssr'),
-  },
-  ({ next }) => {
-    it('should match more specific route along with dynamic routes', async () => {
-      const res1 = await fetchViaHTTP(next.url, '/api/user/login')
-      const res2 = await fetchViaHTTP(next.url, '/api/user/any')
-      expect(await res1.text()).toBe('login')
-      expect(await res2.text()).toBe('[id]')
-    })
+  })
 
-    it('should render styled-jsx styles in streaming', async () => {
-      const html = await renderViaHTTP(next.url, '/')
-      expect(html).toMatch(/color:(?:blue|#00f)/)
-    })
+  it('should match more specific route along with dynamic routes', async () => {
+    const res1 = await fetchViaHTTP(next.url, '/api/user/login')
+    const res2 = await fetchViaHTTP(next.url, '/api/user/any')
+    expect(await res1.text()).toBe('login')
+    expect(await res2.text()).toBe('[id]')
+  })
 
-    it('should redirect paths without trailing-slash and render when slash is appended', async () => {
-      const page = '/hello'
-      const redirectRes = await fetchViaHTTP(
-        next.url,
-        page,
-        {},
-        { redirect: 'manual' }
-      )
-      const res = await fetchViaHTTP(next.url, page + '/')
-      const html = await res.text()
+  it('should render styled-jsx styles in streaming', async () => {
+    const html = await renderViaHTTP(next.url, '/')
+    expect(html).toMatch(/color:(?:blue|#00f)/)
+  })
 
-      expect(redirectRes.status).toBe(308)
-      expect(res.status).toBe(200)
-      expect(html).toContain('hello nextjs')
-      expect(html).toContain('home')
-    })
+  it('should redirect paths without trailing-slash and render when slash is appended', async () => {
+    const page = '/hello'
+    const redirectRes = await fetchViaHTTP(
+      next.url,
+      page,
+      {},
+      { redirect: 'manual' }
+    )
+    const res = await fetchViaHTTP(next.url, page + '/')
+    const html = await res.text()
 
-    it('should render next/router correctly in edge runtime', async () => {
-      const html = await renderViaHTTP(next.url, '/router')
-      expect(html).toContain('link')
-    })
+    expect(redirectRes.status).toBe(308)
+    expect(res.status).toBe(200)
+    expect(html).toContain('hello nextjs')
+    expect(html).toContain('home')
+  })
 
-    it('should render multi-byte characters correctly in streaming', async () => {
-      const html = await renderViaHTTP(next.url, '/multi-byte')
-      expect(html).toContain('マルチバイト'.repeat(28))
-    })
+  it('should render next/router correctly in edge runtime', async () => {
+    const html = await renderViaHTTP(next.url, '/router')
+    expect(html).toContain('link')
+  })
 
-    if ((global as any).isNextDev) {
-      it('should work with custom document', async () => {
-        await next.patchFile(
-          'pages/_document.js',
-          `
-        import { Html, Head, Main, NextScript } from 'next/document'
+  it('should render multi-byte characters correctly in streaming', async () => {
+    const html = await renderViaHTTP(next.url, '/multi-byte')
+    expect(html).toContain('マルチバイト'.repeat(28))
+  })
 
-        export default function Document() {
-          return (
-            <Html>
-              <Head />
-              <body>
-                <Main />
-                <NextScript />
-              </body>
-            </Html>
-          )
-        }
-      `
+  if (isNextDev) {
+    it('should work with custom document', async () => {
+      await next.patchFile(
+        'pages/_document.js',
+        `
+      import { Html, Head, Main, NextScript } from 'next/document'
+
+      export default function Document() {
+        return (
+          <Html>
+            <Head />
+            <body>
+              <Main />
+              <NextScript />
+            </body>
+          </Html>
         )
-        await check(async () => {
-          return await renderViaHTTP(next.url, '/')
-        }, /index/)
-        await next.deleteFile('pages/_document.js')
-      })
-    }
+      }
+    `
+      )
+      await check(async () => {
+        return await renderViaHTTP(next.url, '/')
+      }, /index/)
+      await next.deleteFile('pages/_document.js')
+    })
   }
-)
+})
 
 if (isNextProd) {
   describe('streaming SSR with custom server', () => {
-    let next
+    const { next } = nextTestSetup({
+      files: join(__dirname, 'custom-server'),
+      skipStart: true,
+    })
+
     let server
     let appPort
     beforeAll(async () => {
-      next = await createNext({
-        files: join(__dirname, 'custom-server'),
-      })
-      await next.stop()
+      const { exitCode } = await next.build()
+      if (exitCode !== 0) {
+        throw new Error(`Failed to build next: ${exitCode}`)
+      }
 
       const testServer = join(next.testDir, 'server.js')
       appPort = await findPort()
@@ -104,6 +105,7 @@ if (isNextProd) {
         /Listening/,
         {
           ...process.env,
+          ...next.env,
           PORT: appPort,
         },
         undefined,
@@ -113,7 +115,6 @@ if (isNextProd) {
       )
     })
     afterAll(async () => {
-      await next.destroy()
       if (server) await killApp(server)
     })
     it('should render page correctly under custom server', async () => {
@@ -123,55 +124,57 @@ if (isNextProd) {
   })
 
   describe('react 18 streaming SSR in minimal mode with node runtime', () => {
-    let next: NextInstance
-
-    beforeAll(async () => {
+    beforeAll(() => {
       if (isNextProd) {
         process.env.NEXT_PRIVATE_MINIMAL_MODE = '1'
       }
+    })
+    afterAll(() => {
+      if (isNextProd) {
+        delete process.env.NEXT_PRIVATE_MINIMAL_MODE
+      }
+    })
 
-      next = await createNext({
-        files: {
-          'pages/index.js': `
+    const { next } = nextTestSetup({
+      files: {
+        'pages/index.js': `
           export default function Page() {
             return <p>streaming</p>
           }
           export async function getServerSideProps() {
             return { props: {} }
           }`,
+      },
+      nextConfig: {
+        webpack(config, { nextRuntime }) {
+          const path = require('path')
+          const fs = require('fs')
+
+          const runtimeFilePath = path.join(__dirname, 'runtimes.txt')
+          let runtimeContent = ''
+
+          try {
+            runtimeContent = fs.readFileSync(runtimeFilePath, 'utf8')
+            runtimeContent += '\n'
+          } catch (_) {}
+
+          runtimeContent += nextRuntime || 'client'
+
+          fs.writeFileSync(runtimeFilePath, runtimeContent)
+          return config
         },
-        nextConfig: {
-          webpack(config, { nextRuntime }) {
-            const path = require('path')
-            const fs = require('fs')
-
-            const runtimeFilePath = path.join(__dirname, 'runtimes.txt')
-            let runtimeContent = ''
-
-            try {
-              runtimeContent = fs.readFileSync(runtimeFilePath, 'utf8')
-              runtimeContent += '\n'
-            } catch (_) {}
-
-            runtimeContent += nextRuntime || 'client'
-
-            fs.writeFileSync(runtimeFilePath, runtimeContent)
-            return config
-          },
-        },
-      })
+      },
     })
-    afterAll(() => {
-      if (isNextProd) {
-        delete process.env.NEXT_PRIVATE_MINIMAL_MODE
+
+    // Relies on the custom webpack config above
+    ;(process.env.IS_TURBOPACK_TEST ? it.skip : it)(
+      'should pass correct nextRuntime values',
+      async () => {
+        const content = await next.readFile('runtimes.txt')
+        // eslint-disable-next-line jest/no-standalone-expect
+        expect(content.split('\n').sort()).toEqual(['client', 'edge', 'nodejs'])
       }
-      next.destroy()
-    })
-
-    it('should pass correct nextRuntime values', async () => {
-      const content = await next.readFile('runtimes.txt')
-      expect(content.split('\n').sort()).toEqual(['client', 'edge', 'nodejs'])
-    })
+    )
 
     it('should generate html response by streaming correctly', async () => {
       const html = await renderViaHTTP(next.url, '/')

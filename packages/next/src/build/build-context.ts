@@ -1,10 +1,10 @@
 import type { LoadedEnvFiles } from '@next/env'
-import type { Rewrite, Redirect } from '../lib/load-custom-routes'
+import type { Rewrite } from '../lib/load-custom-routes'
 import type { __ApiPreviewProps } from '../server/api-utils'
 import type { NextConfigComplete } from '../server/config-shared'
 import type { Span } from '../trace'
 import type getBaseWebpackConfig from './webpack-config'
-import type { TelemetryPluginState } from './webpack/plugins/telemetry-plugin'
+import type { TelemetryPluginState } from './webpack/plugins/telemetry-plugin/telemetry-plugin'
 import type { Telemetry } from '../telemetry/storage'
 
 // A layer for storing data that is used by plugins to communicate with each
@@ -53,7 +53,9 @@ export const NextBuildContext: Partial<{
   pluginState: Record<string, any>
   // core fields
   dir: string
+  distDir: string
   buildId: string
+  encryptionKey: string
   config: NextConfigComplete
   appDir: string
   pagesDir: string
@@ -62,16 +64,12 @@ export const NextBuildContext: Partial<{
     afterFiles: Rewrite[]
     beforeFiles: Rewrite[]
   }
-  originalRewrites: {
-    fallback: Rewrite[]
-    afterFiles: Rewrite[]
-    beforeFiles: Rewrite[]
-  }
-  originalRedirects: Redirect[]
+  hasRewrites: boolean
   loadedEnvFiles: LoadedEnvFiles
   previewProps: __ApiPreviewProps
   mappedPages: MappedPages | undefined
   mappedAppPages: MappedPages | undefined
+  mappedAppDefaults: MappedPages | undefined
   mappedRootPaths: MappedPages
   hasInstrumentationHook: boolean
 
@@ -90,4 +88,11 @@ export const NextBuildContext: Partial<{
   previewModeId: string
   fetchCacheKeyPrefix?: string
   allowedRevalidateHeaderKeys?: string[]
+  isCompileMode?: boolean
+  debugPrerender: boolean
+  analyze: boolean
+  debugBuildPaths?: {
+    app: string[]
+    pages: string[]
+  }
 }> = {}

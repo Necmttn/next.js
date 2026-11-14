@@ -1,49 +1,29 @@
-import { createNextDescribe } from 'e2e-utils'
+import { FileRef, nextTestSetup } from 'e2e-utils'
+import { join } from 'path'
 
-createNextDescribe(
-  'app dir - not-found - conflict route',
-  {
-    files: __dirname,
-    skipDeployment: true,
-  },
-  ({ next }) => {
-    const runTests = () => {
-      it('should use the not-found page for non-matching routes', async () => {
-        const browser = await next.browser('/random-content')
-        expect(await browser.elementByCss('h1').text()).toContain(
-          'This Is The Not Found Page'
-        )
-        // should contain root layout content
-        expect(await browser.elementByCss('#layout-nav').text()).toBe('Navbar')
-      })
-
-      it('should allow to have a valid /not-found route', async () => {
-        const html = await next.render('/not-found')
-        expect(html).toContain("I'm still a valid page")
-      })
-    }
-
-    describe('with default runtime', () => {
-      runTests()
+describe('app dir - not-found - conflict route', () => {
+  describe.each(['default', 'edge'])('with %s runtime', (runtime) => {
+    const { next } = nextTestSetup({
+      files: {
+        app: new FileRef(join(__dirname, 'app')),
+        ...(runtime === 'edge' && {
+          'app/layout.js': new FileRef(join(__dirname, 'edge-layout.js')),
+        }),
+      },
     })
 
-    describe('with runtime = edge', () => {
-      let originalLayout = ''
-
-      beforeAll(async () => {
-        await next.stop()
-        originalLayout = await next.readFile('app/layout.js')
-        await next.patchFile(
-          'app/layout.js',
-          `export const runtime = 'edge'\n${originalLayout}`
-        )
-        await next.start()
-      })
-      afterAll(async () => {
-        await next.patchFile('app/layout.js', originalLayout)
-      })
-
-      runTests()
+    it('should use the not-found page for non-matching routes', async () => {
+      const browser = await next.browser('/random-content')
+      expect(await browser.elementByCss('h1').text()).toContain(
+        'This Is The Not Found Page'
+      )
+      // should contain root layout content
+      expect(await browser.elementByCss('#layout-nav').text()).toBe('Navbar')
     })
-  }
-)
+
+    it('should allow to have a valid /not-found route', async () => {
+      const html = await next.render('/not-found')
+      expect(html).toContain('I am still a valid page')
+    })
+  })
+})

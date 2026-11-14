@@ -1,3 +1,7 @@
-export default function Error({ error }: { error: Error }) {
-  return <h2>{error.message}</h2>;
+"use client";
+
+export default function ErrorPage({ error }: { error: unknown }) {
+  const message = error instanceof Error ? error.message : String(error);
+
+  return <h2>{message}</h2>;
 }

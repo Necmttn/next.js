@@ -1,27 +1,45 @@
+import { getRouteCacheKey, isRouteCacheOwner } from '../route-cache-key'
 import type { CacheFs } from '../../../shared/lib/utils'
 import type { PrerenderManifest } from '../../../build'
-import type {
-  IncrementalCacheValue,
-  IncrementalCacheEntry,
-  IncrementalCache as IncrementalCacheType,
-  IncrementalCacheKindHint,
+import {
+  type IncrementalCacheValue,
+  type IncrementalCacheEntry,
+  type IncrementalCache as IncrementalCacheType,
+  IncrementalCacheKind,
+  CachedRouteKind,
+  type IncrementalResponseCacheEntry,
+  type IncrementalFetchCacheEntry,
+  type GetIncrementalFetchCacheContext,
+  type GetIncrementalResponseCacheContext,
+  type GetIncrementalResponseCacheHandlerContext,
+  type GetIncrementalImageCacheContext,
+  type CachedFetchValue,
+  type SetIncrementalFetchCacheContext,
+  type SetIncrementalResponseCacheContext,
+  type SetIncrementalResponseCacheHandlerContext,
+  type SetIncrementalImageCacheContext,
 } from '../../response-cache'
-
-import FetchCache from './fetch-cache'
+import type { DeepReadonly } from '../../../shared/lib/deep-readonly'
 import FileSystemCache from './file-system-cache'
-import path from '../../../shared/lib/isomorphic/path'
-import { normalizePagePath } from '../../../shared/lib/page-path/normalize-page-path'
 
 import {
-  CACHE_ONE_YEAR,
-  NEXT_CACHE_REVALIDATED_TAGS_HEADER,
-  NEXT_CACHE_REVALIDATE_TAG_TOKEN_HEADER,
+  CACHE_ONE_YEAR_SECONDS,
+  FETCH_CACHE_KEY_EXCLUDED_HEADERS,
+  NEXT_CACHE_TAGS_HEADER,
   PRERENDER_REVALIDATE_HEADER,
 } from '../../../lib/constants'
-
-function toRoute(pathname: string): string {
-  return pathname.replace(/\/$/, '').replace(/\/index$/, '') || '/'
-}
+import { SharedCacheControls } from './shared-cache-controls.external'
+import {
+  getResumeDataCache,
+  workUnitAsyncStorage,
+} from '../../app-render/work-unit-async-storage.external'
+import { InvariantError } from '../../../shared/lib/invariant-error'
+import type { CacheControl, Revalidate } from '../cache-control'
+import { getPreviouslyRevalidatedTags } from '../../server-utils'
+import { workAsyncStorage } from '../../app-render/work-async-storage.external'
+import { createPromiseWithResolvers } from '../../../shared/lib/promise-with-resolvers'
+import { areTagsExpired, areTagsStale } from './tags-manifest.external'
+import type { __ApiPreviewProps } from '../../api-utils'
 
 export interface CacheHandlerContext {
   fs?: CacheFs
@@ -32,17 +50,65 @@ export interface CacheHandlerContext {
   fetchCacheKeyPrefix?: string
   prerenderManifest?: PrerenderManifest
   revalidatedTags: string[]
-  experimental: { ppr: boolean }
-  _appDir: boolean
-  _pagesDir: boolean
   _requestHeaders: IncrementalCache['requestHeaders']
 }
 
 export interface CacheHandlerValue {
-  lastModified?: number
+  lastModified: number
   age?: number
   cacheState?: string
   value: IncrementalCacheValue | null
+  /**
+   * The entry's cache lifetime, as passed to `set()` in `ctx.cacheControl`.
+   * A cache handler that stores it and returns it here lets any instance serve
+   * the entry with its lifetime, including one that did not render it (another
+   * server sharing the cache, or the same server after a restart).
+   */
+  cacheControl?: CacheControl
+}
+
+function toHex(buffer: ArrayBufferView | ArrayBuffer): string {
+  // Hex-encode body bytes losslessly: decoding as UTF-8 would collapse
+  // distinct bytes (0xff/0xfe to U+FFFD) and collide; Buffer isn't on edge.
+  const bytes = isArrayBuffer(buffer)
+    ? new Uint8Array(buffer)
+    : new Uint8Array(buffer.buffer, buffer.byteOffset, buffer.byteLength)
+  let hex = ''
+  for (const byte of bytes) {
+    hex += byte.toString(16).padStart(2, '0')
+  }
+  return hex
+}
+
+type Body = NonNullable<RequestInit['body'] | Request['body']>
+
+// Duck typing to support Edge runtime
+// TODO: Switch to instanceof checks once Edge runtime is removed.
+
+function isArrayBuffer(
+  buffer: ArrayBuffer | ArrayBufferView
+): buffer is ArrayBuffer {
+  return !('buffer' in buffer)
+}
+
+function isBodyByteSequence(
+  body: Body
+): body is ArrayBufferView<ArrayBuffer> | ArrayBuffer {
+  return typeof body === 'object' && 'byteLength' in body
+}
+
+function isBodyReadableStream(body: Body): body is ReadableStream {
+  return typeof (body as any).getReader === 'function'
+}
+
+function isBodyFormDataOrURLSearchParams(
+  body: Body
+): body is FormData | URLSearchParams {
+  return typeof (body as any).keys === 'function'
+}
+
+function isBodyBlob(body: Body): body is Blob {
+  return typeof (body as any).arrayBuffer === 'function'
 }
 
 export class CacheHandler {
@@ -50,91 +116,132 @@ export class CacheHandler {
   constructor(_ctx: CacheHandlerContext) {}
 
   public async get(
-    ..._args: Parameters<IncrementalCache['get']>
+    _cacheKey: string,
+    _ctx:
+      | GetIncrementalFetchCacheContext
+      | GetIncrementalResponseCacheHandlerContext
+      | GetIncrementalImageCacheContext
   ): Promise<CacheHandlerValue | null> {
     return {} as any
   }
 
   public async set(
-    ..._args: Parameters<IncrementalCache['set']>
+    _cacheKey: string,
+    _data: IncrementalCacheValue | null,
+    _ctx:
+      | SetIncrementalFetchCacheContext
+      | SetIncrementalResponseCacheHandlerContext
+      | SetIncrementalImageCacheContext
   ): Promise<void> {}
 
-  public async revalidateTag(_tag: string): Promise<void> {}
+  public async revalidateTag(
+    _tags: string | string[],
+    _durations?: { expire?: number }
+  ): Promise<void> {}
 
   public resetRequestCache(): void {}
 }
 
+async function hashString(cacheString: string): Promise<string> {
+  if (process.env.NEXT_RUNTIME === 'edge') {
+    const encoder = new TextEncoder()
+    const buffer = encoder.encode(cacheString)
+    return toHex(await crypto.subtle.digest('SHA-256', buffer))
+  } else {
+    const crypto = require('crypto') as typeof import('crypto')
+    return crypto.createHash('sha256').update(cacheString).digest('hex')
+  }
+}
+
+// this should be bumped anytime a fix is made to cache entries
+// that should bust the cache
+const MAIN_KEY_PREFIX = 'v4'
+
 export class IncrementalCache implements IncrementalCacheType {
-  dev?: boolean
-  cacheHandler?: CacheHandler
-  hasCustomCacheHandler: boolean
-  prerenderManifest: PrerenderManifest
-  requestHeaders: Record<string, undefined | string | string[]>
-  requestProtocol?: 'http' | 'https'
-  allowedRevalidateHeaderKeys?: string[]
-  minimalMode?: boolean
-  fetchCacheKeyPrefix?: string
-  revalidatedTags?: string[]
-  isOnDemandRevalidate?: boolean
-  private locks = new Map<string, Promise<void>>()
-  private unlocks = new Map<string, () => Promise<void>>()
+  readonly dev?: boolean
+  readonly disableForTestmode?: boolean
+  readonly cacheHandler?: CacheHandler
+  readonly hasCustomCacheHandler: boolean
+  readonly previewProps: DeepReadonly<__ApiPreviewProps>
+  readonly prerenderManifest: DeepReadonly<PrerenderManifest>
+  readonly requestHeaders: Record<string, undefined | string | string[]>
+  readonly allowedRevalidateHeaderKeys?: string[]
+  readonly minimalMode?: boolean
+  readonly fetchCacheKeyPrefix?: string
+  readonly isOnDemandRevalidate?: boolean
+  readonly revalidatedTags?: readonly string[]
+
+  private static readonly debug: boolean =
+    !!process.env.NEXT_PRIVATE_DEBUG_CACHE
+  private readonly locks = new Map<string, Promise<void>>()
+
+  /**
+   * The cache controls for routes. This will source the values from the
+   * prerender manifest until the in-memory cache is updated with new values.
+   */
+  private readonly cacheControls: SharedCacheControls
+  private readonly locales?: readonly string[]
 
   constructor({
     fs,
     dev,
-    appDir,
-    pagesDir,
     flushToDisk,
-    fetchCache,
     minimalMode,
     serverDistDir,
     requestHeaders,
-    requestProtocol,
     maxMemoryCacheSize,
-    getPrerenderManifest,
+    previewProps,
+    prerenderManifest,
     fetchCacheKeyPrefix,
     CurCacheHandler,
     allowedRevalidateHeaderKeys,
-    experimental,
+    locales,
   }: {
     fs?: CacheFs
     dev: boolean
-    appDir?: boolean
-    pagesDir?: boolean
-    fetchCache?: boolean
     minimalMode?: boolean
     serverDistDir?: string
     flushToDisk?: boolean
-    requestProtocol?: 'http' | 'https'
     allowedRevalidateHeaderKeys?: string[]
+    locales?: readonly string[]
     requestHeaders: IncrementalCache['requestHeaders']
     maxMemoryCacheSize?: number
-    getPrerenderManifest: () => PrerenderManifest
+    previewProps: DeepReadonly<__ApiPreviewProps>
+    prerenderManifest: DeepReadonly<PrerenderManifest>
     fetchCacheKeyPrefix?: string
     CurCacheHandler?: typeof CacheHandler
-    experimental: { ppr: boolean }
   }) {
-    const debug = !!process.env.NEXT_PRIVATE_DEBUG_CACHE
     this.hasCustomCacheHandler = Boolean(CurCacheHandler)
+
+    const cacheHandlersSymbol = Symbol.for('@next/cache-handlers')
+    const _globalThis: typeof globalThis & {
+      [cacheHandlersSymbol]?: {
+        FetchCache?: typeof CacheHandler
+      }
+    } = globalThis
+
     if (!CurCacheHandler) {
-      if (fs && serverDistDir) {
-        if (debug) {
-          console.log('using filesystem cache handler')
+      // if we have a global cache handler available leverage it
+      const globalCacheHandler = _globalThis[cacheHandlersSymbol]
+
+      if (globalCacheHandler?.FetchCache) {
+        CurCacheHandler = globalCacheHandler.FetchCache
+        if (IncrementalCache.debug) {
+          console.log('IncrementalCache: using global FetchCache cache handler')
         }
-        CurCacheHandler = FileSystemCache
-      }
-      if (
-        FetchCache.isAvailable({ _requestHeaders: requestHeaders }) &&
-        minimalMode &&
-        fetchCache
-      ) {
-        if (debug) {
-          console.log('using fetch cache handler')
+      } else {
+        if (fs && serverDistDir) {
+          if (IncrementalCache.debug) {
+            console.log('IncrementalCache: using filesystem cache handler')
+          }
+          CurCacheHandler = FileSystemCache
         }
-        CurCacheHandler = FetchCache
       }
-    } else if (debug) {
-      console.log('using custom cache handler', CurCacheHandler.name)
+    } else if (IncrementalCache.debug) {
+      console.log(
+        'IncrementalCache: using custom cache handler',
+        CurCacheHandler.name
+      )
     }
 
     if (process.env.__NEXT_TEST_MAX_ISR_CACHE) {
@@ -142,32 +249,35 @@ export class IncrementalCache implements IncrementalCacheType {
       maxMemoryCacheSize = parseInt(process.env.__NEXT_TEST_MAX_ISR_CACHE, 10)
     }
     this.dev = dev
+    this.disableForTestmode = process.env.NEXT_PRIVATE_TEST_PROXY === 'true'
     // this is a hack to avoid Webpack knowing this is equal to this.minimalMode
     // because we replace this.minimalMode to true in production bundles.
     const minimalModeKey = 'minimalMode'
     this[minimalModeKey] = minimalMode
     this.requestHeaders = requestHeaders
-    this.requestProtocol = requestProtocol
     this.allowedRevalidateHeaderKeys = allowedRevalidateHeaderKeys
-    this.prerenderManifest = getPrerenderManifest()
+    this.previewProps = previewProps
+    this.prerenderManifest = prerenderManifest
+    this.locales = locales
+    this.cacheControls = new SharedCacheControls(
+      this.prerenderManifest,
+      locales
+    )
     this.fetchCacheKeyPrefix = fetchCacheKeyPrefix
     let revalidatedTags: string[] = []
 
     if (
       requestHeaders[PRERENDER_REVALIDATE_HEADER] ===
-      this.prerenderManifest?.preview?.previewModeId
+      this.previewProps.previewModeId
     ) {
       this.isOnDemandRevalidate = true
     }
 
-    if (
-      minimalMode &&
-      typeof requestHeaders[NEXT_CACHE_REVALIDATED_TAGS_HEADER] === 'string' &&
-      requestHeaders[NEXT_CACHE_REVALIDATE_TAG_TOKEN_HEADER] ===
-        this.prerenderManifest?.preview?.previewModeId
-    ) {
-      revalidatedTags =
-        requestHeaders[NEXT_CACHE_REVALIDATED_TAGS_HEADER].split(',')
+    if (minimalMode) {
+      revalidatedTags = this.revalidatedTags = getPreviouslyRevalidatedTags(
+        requestHeaders,
+        this.previewProps.previewModeId
+      )
     }
 
     if (CurCacheHandler) {
@@ -178,31 +288,31 @@ export class IncrementalCache implements IncrementalCacheType {
         serverDistDir,
         revalidatedTags,
         maxMemoryCacheSize,
-        _pagesDir: !!pagesDir,
-        _appDir: !!appDir,
         _requestHeaders: requestHeaders,
         fetchCacheKeyPrefix,
-        experimental,
       })
     }
   }
 
   private calculateRevalidate(
-    pathname: string,
+    cacheControl: CacheControl | undefined,
     fromTime: number,
-    dev?: boolean
-  ): number | false {
+    dev: boolean,
+    isFallback: boolean | undefined
+  ): Revalidate {
     // in development we don't have a prerender-manifest
     // and default to always revalidating to allow easier debugging
-    if (dev) return new Date().getTime() - 1000
+    if (dev)
+      return Math.floor(performance.timeOrigin + performance.now() - 1000)
 
     // if an entry isn't present in routes we fallback to a default
-    // of revalidating after 1 second
-    const { initialRevalidateSeconds } = this.prerenderManifest.routes[
-      toRoute(pathname)
-    ] || {
-      initialRevalidateSeconds: 1,
-    }
+    // of revalidating after 1 second unless it's a fallback request.
+    const initialRevalidateSeconds = cacheControl
+      ? cacheControl.revalidate
+      : isFallback
+        ? false
+        : 1
+
     const revalidateAfter =
       typeof initialRevalidateSeconds === 'number'
         ? initialRevalidateSeconds * 1000 + fromTime
@@ -211,105 +321,83 @@ export class IncrementalCache implements IncrementalCacheType {
     return revalidateAfter
   }
 
-  _getPathname(pathname: string, fetchCache?: boolean) {
-    return fetchCache ? pathname : normalizePagePath(pathname)
-  }
-
   resetRequestCache() {
     this.cacheHandler?.resetRequestCache?.()
   }
 
-  async unlock(cacheKey: string) {
-    const unlock = this.unlocks.get(cacheKey)
-    if (unlock) {
-      unlock()
-      this.locks.delete(cacheKey)
-      this.unlocks.delete(cacheKey)
-    }
-  }
+  async lock(cacheKey: string): Promise<() => Promise<void> | void> {
+    // Wait for any existing lock on this cache key to be released
+    // This implements a simple queue-based locking mechanism
+    while (true) {
+      const lock = this.locks.get(cacheKey)
 
-  async lock(cacheKey: string) {
-    if (
-      process.env.__NEXT_INCREMENTAL_CACHE_IPC_PORT &&
-      process.env.__NEXT_INCREMENTAL_CACHE_IPC_KEY &&
-      process.env.NEXT_RUNTIME !== 'edge'
-    ) {
-      const invokeIpcMethod = require('../server-ipc/request-utils')
-        .invokeIpcMethod as typeof import('../server-ipc/request-utils').invokeIpcMethod
-
-      await invokeIpcMethod({
-        method: 'lock',
-        ipcPort: process.env.__NEXT_INCREMENTAL_CACHE_IPC_PORT,
-        ipcKey: process.env.__NEXT_INCREMENTAL_CACHE_IPC_KEY,
-        args: [cacheKey],
-      })
-
-      return async () => {
-        await invokeIpcMethod({
-          method: 'unlock',
-          ipcPort: process.env.__NEXT_INCREMENTAL_CACHE_IPC_PORT,
-          ipcKey: process.env.__NEXT_INCREMENTAL_CACHE_IPC_KEY,
-          args: [cacheKey],
-        })
+      if (IncrementalCache.debug) {
+        console.log('IncrementalCache: lock get', cacheKey, !!lock)
       }
+
+      // If no lock exists, we can proceed to acquire it
+      if (!lock) break
+
+      // Wait for the existing lock to be released before trying again
+      await lock
     }
 
-    let unlockNext: () => Promise<void> = () => Promise.resolve()
-    const existingLock = this.locks.get(cacheKey)
+    // Create a new detached promise that will represent this lock
+    // The resolve function (unlock) will be returned to the caller
+    const { resolve, promise } = createPromiseWithResolvers<void>()
 
-    if (existingLock) {
-      await existingLock
-    } else {
-      const newLock = new Promise<void>((resolve) => {
-        unlockNext = async () => {
-          resolve()
-        }
-      })
-
-      this.locks.set(cacheKey, newLock)
-      this.unlocks.set(cacheKey, unlockNext)
+    if (IncrementalCache.debug) {
+      console.log('IncrementalCache: successfully locked', cacheKey)
     }
 
-    return unlockNext
+    // Store the lock promise in the locks map
+    this.locks.set(cacheKey, promise)
+
+    return () => {
+      // Resolve the promise to release the lock.
+      resolve()
+
+      // Remove the lock from the map once it's released so that future gets
+      // can acquire the lock.
+      this.locks.delete(cacheKey)
+    }
   }
 
-  async revalidateTag(tag: string) {
-    if (
-      process.env.__NEXT_INCREMENTAL_CACHE_IPC_PORT &&
-      process.env.__NEXT_INCREMENTAL_CACHE_IPC_KEY &&
-      process.env.NEXT_RUNTIME !== 'edge'
-    ) {
-      const invokeIpcMethod = require('../server-ipc/request-utils')
-        .invokeIpcMethod as typeof import('../server-ipc/request-utils').invokeIpcMethod
-      return invokeIpcMethod({
-        method: 'revalidateTag',
-        ipcPort: process.env.__NEXT_INCREMENTAL_CACHE_IPC_PORT,
-        ipcKey: process.env.__NEXT_INCREMENTAL_CACHE_IPC_KEY,
-        args: [...arguments],
-      })
-    }
+  async revalidateTag(
+    tags: string | string[],
+    durations?: { expire?: number }
+  ): Promise<void> {
+    return this.cacheHandler?.revalidateTag(tags, durations)
+  }
 
-    return this.cacheHandler?.revalidateTag?.(tag)
+  async generateSimpleCacheKey(input: string): Promise<string> {
+    const cacheString = JSON.stringify([
+      MAIN_KEY_PREFIX,
+      this.fetchCacheKeyPrefix || '',
+      input,
+    ])
+
+    return hashString(cacheString)
   }
 
   // x-ref: https://github.com/facebook/react/blob/2655c9354d8e1c54ba888444220f63e836925caa/packages/react/src/ReactFetch.js#L23
-  async fetchCacheKey(
+  async generateCacheKey(
     url: string,
     init: RequestInit | Request = {}
   ): Promise<string> {
-    // this should be bumped anytime a fix is made to cache entries
-    // that should bust the cache
-    const MAIN_KEY_PREFIX = 'v3'
-
     const bodyChunks: string[] = []
 
     const encoder = new TextEncoder()
-    const decoder = new TextDecoder()
 
-    if (init.body) {
-      // handle ReadableStream body
-      if (typeof (init.body as any).getReader === 'function') {
-        const readableBody = init.body as ReadableStream<Uint8Array | string>
+    // Will be set implementing https://fetch.spec.whatwg.org/#concept-bodyinit-extract
+    let bodyType: string | null = null
+    const body = init.body
+    if (body) {
+      if (isBodyByteSequence(body)) {
+        bodyChunks.push(`bytes:${toHex(body)}`)
+        ;(init as any)._ogBody = body
+      } else if (isBodyReadableStream(body)) {
+        const readableBody = body
 
         const chunks: Uint8Array[] = []
 
@@ -317,19 +405,12 @@ export class IncrementalCache implements IncrementalCacheType {
           await readableBody.pipeTo(
             new WritableStream({
               write(chunk) {
-                if (typeof chunk === 'string') {
-                  chunks.push(encoder.encode(chunk))
-                  bodyChunks.push(chunk)
-                } else {
-                  chunks.push(chunk)
-                  bodyChunks.push(decoder.decode(chunk, { stream: true }))
-                }
+                chunks.push(
+                  typeof chunk === 'string' ? encoder.encode(chunk) : chunk
+                )
               },
             })
           )
-
-          // Flush the decoder.
-          bodyChunks.push(decoder.decode())
 
           // Create a new buffer with all the chunks.
           const length = chunks.reduce((total, arr) => total + arr.length, 0)
@@ -342,40 +423,57 @@ export class IncrementalCache implements IncrementalCacheType {
             offset += chunk.length
           }
 
+          bodyChunks.push(`bytes:${toHex(arrayBuffer)}`)
           ;(init as any)._ogBody = arrayBuffer
         } catch (err) {
           console.error('Problem reading body', err)
         }
-      } // handle FormData or URLSearchParams bodies
-      else if (typeof (init.body as any).keys === 'function') {
-        const formData = init.body as FormData
-        ;(init as any)._ogBody = init.body
-        for (const key of new Set([...formData.keys()])) {
-          const values = formData.getAll(key)
-          bodyChunks.push(
-            `${key}=${(
-              await Promise.all(
-                values.map(async (val) => {
-                  if (typeof val === 'string') {
-                    return val
-                  } else {
-                    return await val.text()
-                  }
-                })
-              )
-            ).join(',')}`
-          )
+      } else if (isBodyFormDataOrURLSearchParams(body)) {
+        bodyType =
+          String(body) === '[object FormData]'
+            ? // We don't need a boundary because we're not actually using this for a Content-Type header
+              'multipart/form-data; boundary='
+            : 'application/x-www-form-urlencoded;charset=UTF-8'
+        const iterable = body
+        ;(init as any)._ogBody = body
+        // Separate, tagged chunks so `["a","b"]` can't collide with `["a,b"]`.
+        for (const [key, val] of iterable.entries()) {
+          bodyChunks.push(`key:${key}`)
+          if (typeof val === 'string') {
+            bodyChunks.push(`str:${val}`)
+          } else {
+            bodyChunks.push(
+              'file',
+              val.name,
+              val.type,
+              `bytes:${toHex(await val.arrayBuffer())}`
+            )
+          }
         }
         // handle blob body
-      } else if (typeof (init.body as any).arrayBuffer === 'function') {
-        const blob = init.body as Blob
+      } else if (isBodyBlob(body)) {
+        const blob = body
         const arrayBuffer = await blob.arrayBuffer()
-        bodyChunks.push(await blob.text())
+        bodyChunks.push('blob', blob.type, `bytes:${toHex(arrayBuffer)}`)
         ;(init as any)._ogBody = new Blob([arrayBuffer], { type: blob.type })
-      } else if (typeof init.body === 'string') {
-        bodyChunks.push(init.body)
-        ;(init as any)._ogBody = init.body
+        bodyType = blob.type
+      } else if (typeof body === 'string') {
+        bodyChunks.push(`str:${body}`)
+        ;(init as any)._ogBody = body
+        bodyType = 'text/plain;charset=UTF-8'
+      } else {
+        body satisfies never
+        throw new Error(`Unsupported body type: ${typeof body}`)
       }
+    }
+
+    const headers =
+      typeof (init.headers || {}).keys === 'function'
+        ? Object.fromEntries(init.headers as Headers)
+        : Object.assign({} as Record<string, string>, init.headers)
+
+    for (const header of FETCH_CACHE_KEY_EXCLUDED_HEADERS) {
+      if (header in headers) delete headers[header]
     }
 
     const cacheString = JSON.stringify([
@@ -383,9 +481,10 @@ export class IncrementalCache implements IncrementalCacheType {
       this.fetchCacheKeyPrefix || '',
       url,
       init.method,
-      typeof (init.headers || {}).keys === 'function'
-        ? Object.fromEntries(init.headers as Headers)
-        : init.headers,
+      // Ensures default Content-Type is part of the cache key
+      // TODO: Only necessary when headers are not used from the Request instance
+      bodyType,
+      headers,
       init.mode,
       init.redirect,
       init.credentials,
@@ -396,125 +495,264 @@ export class IncrementalCache implements IncrementalCacheType {
       bodyChunks,
     ])
 
-    if (process.env.NEXT_RUNTIME === 'edge') {
-      function bufferToHex(buffer: ArrayBuffer): string {
-        return Array.prototype.map
-          .call(new Uint8Array(buffer), (b) => b.toString(16).padStart(2, '0'))
-          .join('')
-      }
-      const buffer = encoder.encode(cacheString)
-      return bufferToHex(await crypto.subtle.digest('SHA-256', buffer))
-    } else {
-      const crypto = require('crypto') as typeof import('crypto')
-      return crypto.createHash('sha256').update(cacheString).digest('hex')
-    }
+    return hashString(cacheString)
   }
 
-  // get data from cache if available
   async get(
     cacheKey: string,
-    ctx: {
-      kindHint?: IncrementalCacheKindHint
-      revalidate?: number | false
-      fetchUrl?: string
-      fetchIdx?: number
-      tags?: string[]
-      softTags?: string[]
-    } = {}
+    ctx: GetIncrementalFetchCacheContext
+  ): Promise<IncrementalFetchCacheEntry | null>
+  async get(
+    cacheKey: string,
+    ctx: GetIncrementalResponseCacheContext | GetIncrementalImageCacheContext
+  ): Promise<IncrementalResponseCacheEntry | null>
+  async get(
+    cacheKey: string,
+    ctx:
+      | GetIncrementalFetchCacheContext
+      | GetIncrementalResponseCacheContext
+      | GetIncrementalImageCacheContext
   ): Promise<IncrementalCacheEntry | null> {
-    if (
-      process.env.__NEXT_INCREMENTAL_CACHE_IPC_PORT &&
-      process.env.__NEXT_INCREMENTAL_CACHE_IPC_KEY &&
-      process.env.NEXT_RUNTIME !== 'edge'
-    ) {
-      const invokeIpcMethod = require('../server-ipc/request-utils')
-        .invokeIpcMethod as typeof import('../server-ipc/request-utils').invokeIpcMethod
+    if (ctx.kind === IncrementalCacheKind.IMAGE) {
+      throw new InvariantError('Images must use the image optimizer cache')
+    }
+    // Unlike other caches if we have a resume data cache, we use it even if
+    // testmode would normally disable it or if requestHeaders say 'no-cache'.
+    if (ctx.kind === IncrementalCacheKind.FETCH) {
+      const workStore = workAsyncStorage.getStore()
+      const isOnDemandRevalidate =
+        this.isOnDemandRevalidate || workStore?.isOnDemandRevalidate
+      const workUnitStore = workUnitAsyncStorage.getStore()
+      const resumeDataCache = workUnitStore
+        ? getResumeDataCache(workUnitStore)
+        : null
+      if (resumeDataCache) {
+        const memoryCacheData = resumeDataCache.fetch.get(cacheKey)
+        if (memoryCacheData?.kind === CachedRouteKind.FETCH) {
+          // Check if any tags were recently revalidated before returning RDC entry.
+          // When a server action calls updateTag(), the re-render should see fresh
+          // data instead of stale RDC data.
+          const combinedTags = [...(ctx.tags || []), ...(ctx.softTags || [])]
+          const hasRevalidatedTag = combinedTags.some(
+            (tag) =>
+              this.revalidatedTags?.includes(tag) ||
+              workStore?.pendingRevalidatedTags?.some(
+                (item) => item.tag === tag
+              )
+          )
 
-      return invokeIpcMethod({
-        method: 'get',
-        ipcPort: process.env.__NEXT_INCREMENTAL_CACHE_IPC_PORT,
-        ipcKey: process.env.__NEXT_INCREMENTAL_CACHE_IPC_KEY,
-        args: [...arguments],
-      })
+          if (hasRevalidatedTag) {
+            if (IncrementalCache.debug) {
+              console.log('IncrementalCache: rdc:revalidated-tag', cacheKey)
+            }
+            // Fall through to cacheHandler lookup
+          } else {
+            if (IncrementalCache.debug) {
+              console.log('IncrementalCache: rdc:hit', cacheKey)
+            }
+
+            return { isStale: false, value: memoryCacheData }
+          }
+        } else if (IncrementalCache.debug) {
+          console.log('IncrementalCache: rdc:miss', cacheKey)
+        }
+      } else {
+        if (IncrementalCache.debug) {
+          console.log('IncrementalCache: rdc:no-resume-data')
+        }
+      }
+
+      if (isOnDemandRevalidate) {
+        // On-demand revalidation reuses the current render's RDC, but
+        // recomputes persisted data even when its revalidate interval has not
+        // elapsed.
+        return null
+      }
     }
 
     // we don't leverage the prerender cache in dev mode
     // so that getStaticProps is always called for easier debugging
     if (
-      this.dev &&
-      (ctx.kindHint !== 'fetch' ||
-        this.requestHeaders['cache-control'] === 'no-cache')
+      this.disableForTestmode ||
+      (this.dev &&
+        (ctx.kind !== IncrementalCacheKind.FETCH ||
+          this.requestHeaders['cache-control'] === 'no-cache'))
     ) {
       return null
     }
 
-    cacheKey = this._getPathname(cacheKey, ctx.kindHint === 'fetch')
-    let entry: IncrementalCacheEntry | null = null
-    let revalidate = ctx.revalidate
+    let storageKey = cacheKey
+    let handlerContext: Parameters<CacheHandler['get']>[1] = ctx
+    if (ctx.kind !== IncrementalCacheKind.FETCH) {
+      // Ownership scopes the key and metadata inside Next.js. Storage handlers
+      // only need the resulting key and the existing cache options.
+      const { route, ...responseContext } = ctx
+      storageKey = getRouteCacheKey(cacheKey, route)
+      handlerContext = responseContext
+    }
+    const cacheData = await this.cacheHandler?.get(storageKey, handlerContext)
 
-    const cacheData = await this.cacheHandler?.get(cacheKey, ctx)
-
-    if (cacheData?.value?.kind === 'FETCH') {
-      const combinedTags = [...(ctx.tags || []), ...(ctx.softTags || [])]
-      // if a tag was revalidated we don't return stale data
-      if (
-        combinedTags.some((tag) => {
-          return this.revalidatedTags?.includes(tag)
-        })
-      ) {
+    if (ctx.kind === IncrementalCacheKind.FETCH) {
+      if (!cacheData) {
         return null
       }
 
-      revalidate = revalidate || cacheData.value.revalidate
-      const age = (Date.now() - (cacheData.lastModified || 0)) / 1000
+      if (cacheData.value?.kind !== CachedRouteKind.FETCH) {
+        throw new InvariantError(
+          `Expected cached value for cache key ${JSON.stringify(cacheKey)} to be a "FETCH" kind, got ${JSON.stringify(cacheData.value?.kind)} instead.`
+        )
+      }
 
-      const isStale = age > revalidate
+      const workStore = workAsyncStorage.getStore()
+      const combinedTags = [...(ctx.tags || []), ...(ctx.softTags || [])]
+      // if a tag was revalidated we don't return stale data
+      if (
+        combinedTags.some(
+          (tag) =>
+            this.revalidatedTags?.includes(tag) ||
+            workStore?.pendingRevalidatedTags?.some((item) => item.tag === tag)
+        )
+      ) {
+        if (IncrementalCache.debug) {
+          console.log('IncrementalCache: expired tag', cacheKey)
+        }
+
+        return null
+      }
+
+      // As we're able to get the cache entry for this fetch, and the prerender
+      // resume data cache (RDC) is available, it must have been populated by a
+      // previous fetch, but was not yet present in the in-memory cache. This
+      // could be the case when performing multiple renders in parallel during
+      // build time where we de-duplicate the fetch calls.
+      //
+      // We add it to the RDC so that the next fetch call will be able to use it
+      // and it won't have to reach into the fetch cache implementation.
+      const workUnitStore = workUnitAsyncStorage.getStore()
+      if (workUnitStore) {
+        const resumeDataCache = getResumeDataCache(workUnitStore)
+        if (resumeDataCache?.mutable) {
+          if (IncrementalCache.debug) {
+            console.log('IncrementalCache: rdc:set', cacheKey)
+          }
+
+          resumeDataCache.fetch.set(cacheKey, cacheData.value)
+        }
+      }
+
+      const revalidate = ctx.revalidate || cacheData.value.revalidate
+      const age =
+        (performance.timeOrigin +
+          performance.now() -
+          (cacheData.lastModified || 0)) /
+        1000
+
+      let isStale = age > revalidate
       const data = cacheData.value.data
 
-      return {
-        isStale: isStale,
-        value: {
-          kind: 'FETCH',
-          data,
-          revalidate: revalidate,
-        },
-        revalidateAfter: Date.now() + revalidate * 1000,
+      if (areTagsExpired(combinedTags, cacheData.lastModified)) {
+        return null
+      } else if (areTagsStale(combinedTags, cacheData.lastModified)) {
+        isStale = true
       }
+
+      return {
+        isStale,
+        value: { kind: CachedRouteKind.FETCH, data, revalidate },
+      }
+    } else if (cacheData?.value?.kind === CachedRouteKind.FETCH) {
+      throw new InvariantError(
+        `Expected cached value for cache key ${JSON.stringify(cacheKey)} not to be a ${JSON.stringify(ctx.kind)} kind, got "FETCH" instead.`
+      )
     }
 
-    const curRevalidate =
-      this.prerenderManifest.routes[toRoute(cacheKey)]?.initialRevalidateSeconds
+    let entry: IncrementalResponseCacheEntry | null = null
+    const { isFallback } = ctx
+    let cacheControl = this.cacheControls.get(cacheKey, ctx.route)
+
+    // The stored lifetime belongs to this entry, which another instance may
+    // have replaced with a different lifetime. Prefer it over this process's
+    // remembered lifetime, and update the route so revalidation uses it too.
+    if (cacheData?.cacheControl) {
+      cacheControl = cacheData.cacheControl
+      this.cacheControls.set(storageKey, cacheControl)
+    }
 
     let isStale: boolean | -1 | undefined
-    let revalidateAfter: false | number
+    let revalidateAfter: Revalidate
 
     if (cacheData?.lastModified === -1) {
       isStale = -1
-      revalidateAfter = -1 * CACHE_ONE_YEAR
+      revalidateAfter = -1 * CACHE_ONE_YEAR_SECONDS * 1000
     } else {
+      const now = performance.timeOrigin + performance.now()
+      const lastModified = cacheData?.lastModified || now
+
       revalidateAfter = this.calculateRevalidate(
-        cacheKey,
-        cacheData?.lastModified || Date.now(),
-        this.dev && ctx.kindHint !== 'fetch'
+        cacheControl,
+        lastModified,
+        this.dev ?? false,
+        ctx.isFallback
       )
-      isStale =
-        revalidateAfter !== false && revalidateAfter < Date.now()
-          ? true
+
+      // If the route's `expire` time has passed, force a blocking revalidation
+      // by signalling `isStale = -1`. The response cache treats `-1` as "skip
+      // the early SWR resolve" and awaits a fresh render before the user sees a
+      // response.
+      const expireAfter =
+        typeof cacheControl?.expire === 'number'
+          ? cacheControl.expire * 1000 + lastModified
           : undefined
+
+      if (expireAfter !== undefined && expireAfter < now) {
+        isStale = -1
+      } else {
+        isStale =
+          revalidateAfter !== false && revalidateAfter < now ? true : undefined
+
+        // If the stale time couldn't be determined based on the revalidation
+        // time, we check if the tags are expired or stale.
+        if (
+          isStale === undefined &&
+          (cacheData?.value?.kind === CachedRouteKind.APP_PAGE ||
+            cacheData?.value?.kind === CachedRouteKind.APP_ROUTE)
+        ) {
+          const tagsHeader = cacheData.value.headers?.[NEXT_CACHE_TAGS_HEADER]
+
+          if (typeof tagsHeader === 'string') {
+            const cacheTags = tagsHeader.split(',')
+
+            if (cacheTags.length > 0) {
+              if (areTagsExpired(cacheTags, lastModified)) {
+                isStale = -1
+              } else if (areTagsStale(cacheTags, lastModified)) {
+                isStale = true
+              }
+            }
+          }
+        }
+      }
     }
 
     if (cacheData) {
       entry = {
         isStale,
-        curRevalidate,
+        cacheControl,
         revalidateAfter,
         value: cacheData.value,
+        isFallback,
       }
     }
 
     if (
       !cacheData &&
-      this.prerenderManifest.notFoundRoutes.includes(cacheKey)
+      this.prerenderManifest.notFoundRoutes.includes(cacheKey) &&
+      isRouteCacheOwner(
+        cacheKey,
+        ctx.route,
+        this.prerenderManifest.routes[cacheKey],
+        this.locales
+      )
     ) {
       // for the first hit after starting the server the cache
       // may not have a way to save notFound: true so if
@@ -524,77 +762,95 @@ export class IncrementalCache implements IncrementalCacheType {
       entry = {
         isStale,
         value: null,
-        curRevalidate,
+        cacheControl,
         revalidateAfter,
+        isFallback,
       }
-      this.set(cacheKey, entry.value, ctx)
+      this.set(cacheKey, entry.value, { ...ctx, cacheControl })
     }
     return entry
   }
 
-  // populate the incremental cache with new data
+  async set(
+    pathname: string,
+    data: CachedFetchValue | null,
+    ctx: SetIncrementalFetchCacheContext
+  ): Promise<void>
+  async set(
+    pathname: string,
+    data: Exclude<IncrementalCacheValue, CachedFetchValue> | null,
+    ctx: SetIncrementalResponseCacheContext | SetIncrementalImageCacheContext
+  ): Promise<void>
   async set(
     pathname: string,
     data: IncrementalCacheValue | null,
-    ctx: {
-      revalidate?: number | false
-      fetchCache?: boolean
-      fetchUrl?: string
-      fetchIdx?: number
-      tags?: string[]
+    ctx:
+      | SetIncrementalFetchCacheContext
+      | SetIncrementalResponseCacheContext
+      | SetIncrementalImageCacheContext
+  ): Promise<void> {
+    if ('kind' in ctx && ctx.kind === IncrementalCacheKind.IMAGE) {
+      throw new InvariantError('Images must use the image optimizer cache')
     }
-  ) {
-    if (
-      process.env.__NEXT_INCREMENTAL_CACHE_IPC_PORT &&
-      process.env.__NEXT_INCREMENTAL_CACHE_IPC_KEY &&
-      process.env.NEXT_RUNTIME !== 'edge'
-    ) {
-      const invokeIpcMethod = require('../server-ipc/request-utils')
-        .invokeIpcMethod as typeof import('../server-ipc/request-utils').invokeIpcMethod
+    // Even if we otherwise disable caching for testMode or if no fetchCache is
+    // configured we still always stash results in the resume data cache if one
+    // exists. This is because this is a transient in memory cache that
+    // populates caches ahead of a dynamic render in dev mode to allow the RSC
+    // debug info to have the right environment associated to it.
+    if (data?.kind === CachedRouteKind.FETCH) {
+      const workUnitStore = workUnitAsyncStorage.getStore()
+      const resumeDataCache = workUnitStore
+        ? getResumeDataCache(workUnitStore)
+        : null
+      if (resumeDataCache?.mutable) {
+        if (IncrementalCache.debug) {
+          console.log('IncrementalCache: rdc:set', pathname)
+        }
 
-      return invokeIpcMethod({
-        method: 'set',
-        ipcPort: process.env.__NEXT_INCREMENTAL_CACHE_IPC_PORT,
-        ipcKey: process.env.__NEXT_INCREMENTAL_CACHE_IPC_KEY,
-        args: [...arguments],
-      })
+        resumeDataCache.fetch.set(pathname, data)
+      }
     }
 
-    if (this.dev && !ctx.fetchCache) return
+    if (this.disableForTestmode || (this.dev && !ctx.fetchCache)) return
+
+    let storageKey = pathname
+    let handlerContext: Parameters<CacheHandler['set']>[2] = ctx
+    if (!ctx.fetchCache) {
+      const { route, ...responseContext } = ctx
+      if (!route) {
+        throw new InvariantError('Response cache requires a source route')
+      }
+      storageKey = getRouteCacheKey(pathname, route)
+      handlerContext = responseContext
+    }
+
     // FetchCache has upper limit of 2MB per-entry currently
+    const itemSize = JSON.stringify(data).length
     if (
       ctx.fetchCache &&
-      // we don't show this error/warning when a custom cache handler is being used
-      // as it might not have this limit
+      itemSize > 2 * 1024 * 1024 &&
+      // We ignore the size limit when custom cache handler is being used, as it
+      // might not have this limit
       !this.hasCustomCacheHandler &&
-      JSON.stringify(data).length > 2 * 1024 * 1024
+      // We also ignore the size limit when it's an implicit build-time-only
+      // caching that the user isn't even aware of.
+      !ctx.isImplicitBuildTimeCache
     ) {
+      const warningText = `Failed to set Next.js data cache for ${ctx.fetchUrl || pathname}, items over 2MB can not be cached (${itemSize} bytes)`
+
       if (this.dev) {
-        throw new Error(`fetch for over 2MB of data can not be cached`)
+        throw new Error(warningText)
       }
+      console.warn(warningText)
       return
     }
 
-    pathname = this._getPathname(pathname, ctx.fetchCache)
-
     try {
-      // we use the prerender manifest memory instance
-      // to store revalidate timings for calculating
-      // revalidateAfter values so we update this on set
-      if (typeof ctx.revalidate !== 'undefined' && !ctx.fetchCache) {
-        this.prerenderManifest.routes[pathname] = {
-          experimentalPPR: undefined,
-          dataRoute: path.posix.join(
-            '/_next/data',
-            `${normalizePagePath(pathname)}.json`
-          ),
-          srcRoute: null, // FIXME: provide actual source route, however, when dynamically appending it doesn't really matter
-          initialRevalidateSeconds: ctx.revalidate,
-          // Pages routes do not have a prefetch data route.
-          prefetchDataRoute: undefined,
-        }
+      if (!ctx.fetchCache && ctx.cacheControl) {
+        this.cacheControls.set(storageKey, ctx.cacheControl)
       }
-      await this.cacheHandler?.set(pathname, data, ctx)
+
+      await this.cacheHandler?.set(storageKey, data, handlerContext)
     } catch (error) {
       console.warn('Failed to update prerender cache for', pathname, error)
     }

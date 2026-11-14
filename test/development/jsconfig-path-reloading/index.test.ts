@@ -1,53 +1,46 @@
-import { createNext, FileRef } from 'e2e-utils'
-import { NextInstance } from 'test/lib/next-modes/base'
+import { FileRef, nextTestSetup } from 'e2e-utils'
 import {
+  waitForRedbox,
+  waitForNoRedbox,
   check,
-  hasRedbox,
   renderViaHTTP,
   getRedboxSource,
 } from 'next-test-utils'
 import cheerio from 'cheerio'
 import { join } from 'path'
-import webdriver from 'next-webdriver'
 import fs from 'fs-extra'
 
 describe('jsconfig-path-reloading', () => {
-  let next: NextInstance
   const tsConfigFile = 'jsconfig.json'
   const indexPage = 'pages/index.js'
 
+  const tsConfigContent = fs.readFileSync(
+    join(__dirname, 'app/jsconfig.json'),
+    'utf8'
+  )
+
   function runTests({ addAfterStart }: { addAfterStart?: boolean }) {
-    beforeAll(async () => {
-      let tsConfigContent = await fs.readFile(
-        join(__dirname, 'app/jsconfig.json'),
-        'utf8'
-      )
-
-      next = await createNext({
-        files: {
-          components: new FileRef(join(__dirname, 'app/components')),
-          pages: new FileRef(join(__dirname, 'app/pages')),
-          lib: new FileRef(join(__dirname, 'app/lib')),
-          ...(addAfterStart
-            ? {}
-            : {
-                [tsConfigFile]: tsConfigContent,
-              }),
-        },
-        dependencies: {
-          typescript: 'latest',
-          '@types/react': 'latest',
-          '@types/node': 'latest',
-        },
-      })
-
-      if (addAfterStart) {
-        await next.patchFile(tsConfigFile, tsConfigContent)
-        // wait a bit for the file watcher to pick up the change
-        await new Promise((resolve) => setTimeout(resolve, 200))
-      }
+    const { next } = nextTestSetup({
+      files: {
+        components: new FileRef(join(__dirname, 'app/components')),
+        pages: new FileRef(join(__dirname, 'app/pages')),
+        lib: new FileRef(join(__dirname, 'app/lib')),
+        ...(addAfterStart
+          ? {}
+          : {
+              [tsConfigFile]: tsConfigContent,
+            }),
+      },
+      dependencies: {
+        '@types/react': 'latest',
+      },
     })
-    afterAll(() => next.destroy())
+
+    if (addAfterStart) {
+      beforeAll(async () => {
+        await next.patchFile(tsConfigFile, tsConfigContent)
+      })
+    }
 
     it('should load with initial paths config correctly', async () => {
       const html = await renderViaHTTP(next.url, '/')
@@ -66,7 +59,7 @@ describe('jsconfig-path-reloading', () => {
       const tsconfigContent = await next.readFile(tsConfigFile)
       const parsedTsConfig = JSON.parse(tsconfigContent)
 
-      const browser = await webdriver(next.url, '/')
+      const browser = await next.browser('/')
 
       try {
         const html = await browser.eval('document.documentElement.innerHTML')
@@ -83,7 +76,7 @@ describe('jsconfig-path-reloading', () => {
           )}`
         )
 
-        expect(await hasRedbox(browser)).toBe(true)
+        await waitForRedbox(browser)
         expect(await getRedboxSource(browser)).toContain('"@lib/second-data"')
 
         await next.patchFile(
@@ -104,7 +97,7 @@ describe('jsconfig-path-reloading', () => {
           )
         )
 
-        expect(await hasRedbox(browser)).toBe(false)
+        await waitForNoRedbox(browser)
 
         const html2 = await browser.eval('document.documentElement.innerHTML')
         expect(html2).toContain('first button')
@@ -129,7 +122,7 @@ describe('jsconfig-path-reloading', () => {
       const tsconfigContent = await next.readFile(tsConfigFile)
       const parsedTsConfig = JSON.parse(tsconfigContent)
 
-      const browser = await webdriver(next.url, '/')
+      const browser = await next.browser('/')
 
       try {
         const html = await browser.eval('document.documentElement.innerHTML')
@@ -159,7 +152,7 @@ describe('jsconfig-path-reloading', () => {
           indexContent.replace('@mybutton', '@myotherbutton')
         )
 
-        expect(await hasRedbox(browser)).toBe(false)
+        await waitForNoRedbox(browser)
 
         await check(async () => {
           const html2 = await browser.eval('document.documentElement.innerHTML')

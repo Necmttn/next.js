@@ -1,27 +1,56 @@
-import { nextBuild } from 'next-test-utils'
+import { nextTestSetup } from 'e2e-utils'
 
 describe('worker-restart', () => {
-  it('should properly exhaust all restart attempts and not fail with any worker errors', async () => {
-    const { stdout, stderr } = await nextBuild(__dirname, [], {
-      stdout: true,
-      stderr: true,
+  describe('timeout', () => {
+    const { next } = nextTestSetup({
+      files: __dirname + '/fixtures/timeout',
+      skipStart: true,
     })
 
-    const output = stdout + stderr
-    expect(output).toContain(
-      'Sending SIGTERM signal to static worker due to timeout of 10 seconds. Subsequent errors may be a result of the worker exiting.'
-    )
-    expect(output).toContain(
-      'Static worker exited with code: null and signal: SIGTERM'
-    )
-    expect(output).toContain(
-      'Restarted static page generation for /bad-page because it took more than 10 seconds'
-    )
-    expect(output).toContain(
-      'Static page generation for /bad-page is still timing out after 3 attempts'
-    )
-    expect(output).not.toContain(
-      'Error: Farm is ended, no more calls can be done to it'
-    )
+    it('should properly exhaust all restart attempts and not fail with any worker errors', async () => {
+      const { cliOutput } = await next.build()
+      expect(cliOutput).toContain(
+        'Failed to build /bad-page/page: /bad-page (attempt 1 of 3) because it took more than 10 seconds. Retrying again shortly.'
+      )
+      expect(cliOutput).toContain(
+        'Failed to build /bad-page/page: /bad-page (attempt 2 of 3) because it took more than 10 seconds. Retrying again shortly.'
+      )
+      expect(cliOutput).toContain(
+        'Failed to build /bad-page/page: /bad-page after 3 attempts'
+      )
+      expect(cliOutput).not.toContain(
+        'Error: Farm is ended, no more calls can be done to it'
+      )
+    })
+  })
+
+  describe('retries', () => {
+    const { next } = nextTestSetup({
+      files: __dirname + '/fixtures/retries',
+      skipStart: true,
+    })
+
+    it('should support configurable static generation retries', async () => {
+      const { cliOutput } = await next.build()
+      expect(cliOutput).toContain('This page is bad!')
+      expect(cliOutput).toContain(
+        'Failed to build /page: / (attempt 2 of 3). Retrying again shortly.'
+      )
+      expect(cliOutput).toContain('Failed to build /page: / after 3 attempts.')
+    })
+  })
+
+  describe('worker-kill', () => {
+    const { next } = nextTestSetup({
+      files: __dirname + '/fixtures/worker-kill',
+      skipStart: true,
+    })
+
+    it('should fail the build if a worker process is killed', async () => {
+      const { cliOutput } = await next.build()
+      expect(cliOutput).toContain(
+        'Next.js build worker exited with code: null and signal: SIGKILL'
+      )
+    })
   })
 })

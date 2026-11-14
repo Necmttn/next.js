@@ -1,51 +1,117 @@
 import { loadEnvConfig } from '@next/env'
+import * as inspector from 'inspector'
 import * as Log from '../../build/output/log'
-import { bold, purple } from '../../lib/picocolors'
+import { bold, purple, strikethrough } from '../../lib/picocolors'
+import type { ConfiguredExperimentalFeature } from '../config'
+import { experimentalSchema } from '../config-schema'
+import { bundlerName, getBundlerFromEnv } from '../../lib/bundler'
 import {
-  PHASE_DEVELOPMENT_SERVER,
-  PHASE_PRODUCTION_BUILD,
-} from '../../shared/lib/constants'
-import loadConfig, { getEnabledExperimentalFeatures } from '../config'
+  hasCurrentAgentUpgrade,
+  removeAgentUpgradeFiles,
+  writeAgentUpgradeFiles,
+  hasCurrentAgentFeedback,
+  hasCurrentAgentRules,
+  removeAgentFeedbackFiles,
+  removeAgentRulesFiles,
+  writeAgentFeedbackFiles,
+  writeAgentFiles,
+  type AgentFilesResult,
+} from './generate-agent-files'
 
+// Re-export the type for consumers
+export type { ConfiguredExperimentalFeature }
+
+/**
+ * Logs basic startup info that doesn't require config.
+ * Called before "Ready in X" to show immediate feedback.
+ */
 export function logStartInfo({
   networkUrl,
   appUrl,
   envInfo,
-  expFeatureInfo,
-  maxExperimentalFeatures,
+  logBundler,
 }: {
   networkUrl: string | null
   appUrl: string | null
   envInfo?: string[]
-  expFeatureInfo?: string[]
-  maxExperimentalFeatures?: number
+  logBundler: boolean
 }) {
+  const versionSuffix = logBundler
+    ? ` (${bundlerName(getBundlerFromEnv())})`
+    : ''
+
   Log.bootstrap(
-    bold(
-      purple(
-        ` ${Log.prefixes.ready} Next.js ${process.env.__NEXT_VERSION}${
-          process.env.TURBOPACK ? ' (turbo)' : ''
-        }`
-      )
-    )
+    `${bold(
+      purple(`${Log.prefixes.ready} Next.js ${process.env.__NEXT_VERSION}`)
+    )}${versionSuffix}`
   )
   if (appUrl) {
-    Log.bootstrap(` - Local:        ${appUrl}`)
+    Log.bootstrap(`- Local:         ${appUrl}`)
   }
   if (networkUrl) {
-    Log.bootstrap(` - Network:      ${networkUrl}`)
+    Log.bootstrap(`- Network:       ${networkUrl}`)
   }
-  if (envInfo?.length) Log.bootstrap(` - Environments: ${envInfo.join(', ')}`)
+  const inspectorUrl = inspector.url()
+  if (inspectorUrl) {
+    // Could also parse this port from the inspector URL.
+    // process.debugPort will always be defined even if the process is not being inspected.
+    // The full URL seems noisy as far as I can tell.
+    // Node.js will print the full URL anyway.
+    const debugPort = process.debugPort
+    Log.bootstrap(`- Debugger port: ${debugPort}`)
+  }
+  if (envInfo?.length) Log.bootstrap(`- Environments: ${envInfo.join(', ')}`)
+}
 
-  if (expFeatureInfo?.length) {
-    Log.bootstrap(` - Experiments (use at your own risk):`)
-    // only show maximum 3 flags
-    for (const exp of expFeatureInfo.slice(0, maxExperimentalFeatures)) {
-      Log.bootstrap(`   · ${exp}`)
-    }
-    /* ${expFeatureInfo.length - 3} more */
-    if (expFeatureInfo.length > 3 && maxExperimentalFeatures) {
-      Log.bootstrap(`   · ...`)
+/**
+ * Logs experimental features and config-dependent info.
+ * Called after getRequestHandlers completes.
+ */
+export function logExperimentalInfo({
+  experimentalFeatures,
+  cacheComponents,
+  partialPrefetching,
+}: {
+  experimentalFeatures?: ConfiguredExperimentalFeature[]
+  cacheComponents?: boolean
+  partialPrefetching?: boolean
+}) {
+  if (cacheComponents) {
+    Log.bootstrap(`- Cache Components enabled`)
+  }
+
+  if (partialPrefetching) {
+    Log.bootstrap(`- Partial Prefetching enabled`)
+  }
+
+  if (experimentalFeatures?.length) {
+    Log.bootstrap(`- Experiments (use with caution):`)
+    for (const exp of experimentalFeatures) {
+      const isValid = Object.prototype.hasOwnProperty.call(
+        experimentalSchema,
+        exp.key
+      )
+      if (isValid) {
+        const symbol =
+          typeof exp.value === 'boolean'
+            ? exp.value === true
+              ? bold('✓')
+              : bold('⨯')
+            : '·'
+
+        const suffix =
+          typeof exp.value === 'number' || typeof exp.value === 'string'
+            ? `: ${JSON.stringify(exp.value)}`
+            : ''
+
+        const reason = exp.reason ? ` (${exp.reason})` : ''
+
+        Log.bootstrap(`  ${symbol} ${exp.key}${suffix}${reason}`)
+      } else {
+        Log.bootstrap(
+          `  ? ${strikethrough(exp.key)} (invalid experimental key)`
+        )
+      }
     }
   }
 
@@ -53,40 +119,56 @@ export function logStartInfo({
   Log.info('')
 }
 
-export async function getStartServerInfo(
+/**
+ * Keep the agent-rules block in sync with next.config.
+ * Disabling it removes only that managed block.
+ */
+export async function syncAgentRulesForDev(
   dir: string,
-  dev: boolean
-): Promise<{
-  envInfo?: string[]
-  expFeatureInfo?: string[]
-}> {
-  let expFeatureInfo: string[] = []
-  await loadConfig(
-    dev ? PHASE_DEVELOPMENT_SERVER : PHASE_PRODUCTION_BUILD,
-    dir,
-    {
-      onLoadUserConfig(userConfig) {
-        const userNextConfigExperimental = getEnabledExperimentalFeatures(
-          userConfig.experimental
-        )
-        expFeatureInfo = userNextConfigExperimental.sort(
-          (a, b) => a.length - b.length
-        )
-      },
-    }
-  )
+  enabled: boolean
+): Promise<AgentFilesResult | null> {
+  if (!enabled) return removeAgentRulesFiles(dir)
+  if (hasCurrentAgentRules(dir)) return null
 
-  // we need to reset env if we are going to create
-  // the worker process with the esm loader so that the
-  // initial env state is correct
-  let envInfo: string[] = []
+  return writeAgentFiles(dir)
+}
+
+/**
+ * Keep the opt-in agent-feedback block in sync with next.config.
+ * Disabling it removes only that managed block.
+ */
+export async function syncAgentFeedbackForDev(
+  dir: string,
+  enabled: boolean
+): Promise<AgentFilesResult | null> {
+  if (!enabled) return removeAgentFeedbackFiles(dir)
+  if (hasCurrentAgentFeedback(dir)) return null
+
+  return writeAgentFeedbackFiles(dir)
+}
+
+/**
+ * Sync upgrade delegation using the reminder policy independently of agentRules.
+ * Disabling reminders removes only this managed block.
+ */
+export async function syncAgentUpgradeForDev(
+  dir: string,
+  enabled: boolean
+): Promise<AgentFilesResult | null> {
+  if (!enabled) {
+    return removeAgentUpgradeFiles(dir)
+  }
+  if (hasCurrentAgentUpgrade(dir)) {
+    return null
+  }
+
+  return writeAgentUpgradeFiles(dir)
+}
+
+/**
+ * Gets environment info for logging. Fast operation that doesn't require config.
+ */
+export function getEnvInfo(dir: string): string[] {
   const { loadedEnvFiles } = loadEnvConfig(dir, true, console, false)
-  if (loadedEnvFiles.length > 0) {
-    envInfo = loadedEnvFiles.map((f) => f.path)
-  }
-
-  return {
-    envInfo,
-    expFeatureInfo,
-  }
+  return loadedEnvFiles.map((f) => f.path)
 }

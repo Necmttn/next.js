@@ -1,15 +1,15 @@
 import type { webpack } from 'next/dist/compiled/webpack/webpack'
-import type { MiddlewareConfig } from '../../../analysis/get-page-static-info'
+import type { ProxyConfig } from '../../../analysis/get-page-static-info'
 
 import { stringify } from 'querystring'
 import {
   type ModuleBuildInfo,
   getModuleBuildInfo,
 } from '../get-module-build-info'
-import { RouteKind } from '../../../../server/future/route-kind'
+import { RouteKind } from '../../../../server/route-kind'
 import { normalizePagePath } from '../../../../shared/lib/page-path/normalize-page-path'
 import { decodeFromBase64, encodeToBase64 } from '../utils'
-import { isInstrumentationHookFile } from '../../../worker'
+import { isInstrumentationHookFile } from '../../../utils'
 import { loadEntrypoint } from '../../../load-entrypoint'
 import type { MappedPages } from '../../../build-context'
 
@@ -18,7 +18,7 @@ type RouteLoaderOptionsPagesAPIInput = {
   page: string
   preferredRegion: string | string[] | undefined
   absolutePagePath: string
-  middlewareConfig: MiddlewareConfig
+  middlewareConfig: ProxyConfig
 }
 
 type RouteLoaderOptionsPagesInput = {
@@ -27,7 +27,7 @@ type RouteLoaderOptionsPagesInput = {
   pages: MappedPages
   preferredRegion: string | string[] | undefined
   absolutePagePath: string
-  middlewareConfig: MiddlewareConfig
+  middlewareConfig: ProxyConfig
 }
 
 type RouteLoaderOptionsInput =
@@ -148,9 +148,7 @@ const loadPages = async (
   }: RouteLoaderPagesOptions,
   buildInfo: ModuleBuildInfo
 ) => {
-  const middlewareConfig: MiddlewareConfig = decodeFromBase64(
-    middlewareConfigBase64
-  )
+  const middlewareConfig: ProxyConfig = decodeFromBase64(middlewareConfigBase64)
 
   // Attach build info to the module.
   buildInfo.route = {
@@ -187,9 +185,7 @@ const loadPagesAPI = async (
   }: RouteLoaderPagesAPIOptions,
   buildInfo: ModuleBuildInfo
 ) => {
-  const middlewareConfig: MiddlewareConfig = decodeFromBase64(
-    middlewareConfigBase64
-  )
+  const middlewareConfig: ProxyConfig = decodeFromBase64(middlewareConfigBase64)
 
   // Attach build info to the module.
   buildInfo.route = {

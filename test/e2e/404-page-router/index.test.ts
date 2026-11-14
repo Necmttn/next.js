@@ -1,9 +1,7 @@
 import path from 'path'
 import fs from 'fs-extra'
-import webdriver from 'next-webdriver'
-import { createNext, FileRef } from 'e2e-utils'
-import { check } from 'next-test-utils'
-import { type NextInstance } from 'test/lib/next-modes/base'
+import { FileRef, nextTestSetup, isNextDev } from 'e2e-utils'
+import { check, retry } from 'next-test-utils'
 
 const pathnames = {
   '/404': ['/not/a/real/page?with=query', '/not/a/real/page'],
@@ -21,7 +19,7 @@ const table = [
   { basePath: true, i18n: true, middleware: false },
   { basePath: false, i18n: false, middleware: false },
 
-  ...((global as any).isNextDev
+  ...(isNextDev
     ? []
     : [
         // TODO: investigate this failure in development
@@ -36,29 +34,23 @@ module.exports = {
 }
 `
 
+// TODO(deploy-test-completion): Re-enable this suite in deploy mode.
+// It currently avoids creating five deployments rather than documenting an incompatibility.
+// @force-gate !deploy
 describe('404-page-router', () => {
-  let next: NextInstance
-
-  beforeAll(async () => {
-    const files = {
+  const { next } = nextTestSetup({
+    files: {
       pages: new FileRef(path.join(__dirname, 'app/pages')),
       components: new FileRef(path.join(__dirname, 'app/components')),
-    }
-    next = await createNext({ files, skipStart: true })
+    },
+    skipStart: true,
+    patchFileDelay: 500,
   })
-  afterAll(() => next.destroy())
 
   describe.each(table)(
     '404-page-router with basePath of $basePath and i18n of $i18n and middleware $middleware',
     (options) => {
-      const isDev = (global as any).isNextDev
-
-      if ((global as any).isNextDeploy) {
-        // TODO: investigate condensing these tests to avoid
-        // 5 separate deploys for this one test
-        it('should skip for deploy', () => {})
-        return
-      }
+      const isDev = isNextDev
 
       beforeAll(async () => {
         // Only add in the middleware if we're testing with middleware enabled.
@@ -123,34 +115,31 @@ describe('404-page-router', () => {
 
       describe.each(urls)('for $url', ({ url, pathname, asPath }) => {
         it('should have the correct router parameters after it is ready', async () => {
-          const query = url.split('?', 2)[1] ?? ''
-          const browser = await webdriver(next.url, url)
+          const query = url.split('?', 2)[1] ?? '<empty>'
+          const browser = await next.browser(url)
 
-          try {
-            await check(
-              () => browser.eval('next.router.isReady ? "yes" : "no"'),
-              'yes'
-            )
-            expect(await browser.elementById('pathname').text()).toEqual(
-              pathname
-            )
-            expect(await browser.elementById('asPath').text()).toEqual(asPath)
-            expect(await browser.elementById('query').text()).toEqual(query)
-          } finally {
-            await browser.close()
-          }
+          await check(
+            () => browser.eval('next.router.isReady ? "yes" : "no"'),
+            'yes'
+          )
+          expect(await browser.elementById('pathname').text()).toEqual(pathname)
+          expect(await browser.elementById('asPath').text()).toEqual(asPath)
+          expect(await browser.elementById('query').text()).toEqual(query)
         })
       })
 
       // It should not throw any errors when re-fetching the route info:
       // https://github.com/vercel/next.js/issues/44293
       it('should not throw any errors when re-fetching the route info', async () => {
-        const browser = await webdriver(next.url, '/?test=1')
+        const browser = await next.browser('/?test=1')
         await check(
           () => browser.eval('next.router.isReady ? "yes" : "no"'),
           'yes'
         )
-        expect(await browser.elementById('query').text()).toEqual('test=1')
+
+        await retry(async () => {
+          expect(await browser.elementById('query').text()).toEqual('test=1')
+        })
       })
     }
   )

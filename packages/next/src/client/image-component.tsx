@@ -3,12 +3,11 @@
 import React, {
   useRef,
   useEffect,
-  useCallback,
   useContext,
-  useMemo,
   useState,
   forwardRef,
-  version,
+  use,
+  useLayoutEffect,
 } from 'react'
 import ReactDOM from 'react-dom'
 import Head from '../shared/lib/head'
@@ -20,20 +19,13 @@ import type {
   OnLoadingComplete,
   PlaceholderValue,
 } from '../shared/lib/get-img-props'
-import type {
-  ImageConfigComplete,
-  ImageLoaderProps,
-} from '../shared/lib/image-config'
-import { imageConfigDefault } from '../shared/lib/image-config'
-import { ImageConfigContext } from '../shared/lib/image-config-context.shared-runtime'
-import { warnOnce } from '../shared/lib/utils/warn-once'
+import type { ImageLoaderProps } from '../shared/lib/image-config'
 import { RouterContext } from '../shared/lib/router-context.shared-runtime'
+import { useImageConfig } from './use-image-config'
 
-// @ts-ignore - This is replaced by webpack alias
+// This is replaced by webpack alias
 import defaultLoader from 'next/dist/shared/lib/image-loader'
-
-// This is replaced by webpack define plugin
-const configEnv = process.env.__NEXT_IMAGE_OPTS as any as ImageConfigComplete
+import { useMergedRef } from './use-merged-ref'
 
 if (typeof window === 'undefined') {
   ;(globalThis as any).__NEXT_IMAGE_IMPORTED = true
@@ -43,7 +35,7 @@ export type { ImageLoaderProps }
 export type ImageLoader = (p: ImageLoaderProps) => string
 
 type ImgElementWithDataProp = HTMLImageElement & {
-  'data-loaded-src': string | undefined
+  'data-loaded-src'?: string | undefined
 }
 
 type ImageElementProps = ImgProps & {
@@ -53,6 +45,7 @@ type ImageElementProps = ImgProps & {
   onLoadingCompleteRef: React.MutableRefObject<OnLoadingComplete | undefined>
   setBlurComplete: (b: boolean) => void
   setShowAltText: (b: boolean) => void
+  sizesInput: string | undefined
 }
 
 // See https://stackoverflow.com/q/39777833/266535 for why we use this ref
@@ -63,7 +56,8 @@ function handleLoading(
   onLoadRef: React.MutableRefObject<OnLoad | undefined>,
   onLoadingCompleteRef: React.MutableRefObject<OnLoadingComplete | undefined>,
   setBlurComplete: (b: boolean) => void,
-  unoptimized: boolean
+  unoptimized: boolean,
+  sizesInput: string | undefined
 ) {
   const src = img?.src
   if (!img || img['data-loaded-src'] === src) {
@@ -113,18 +107,23 @@ function handleLoading(
       onLoadingCompleteRef.current(img)
     }
     if (process.env.NODE_ENV !== 'production') {
+      const { warnOnce } =
+        require('../shared/lib/utils/warn-once') as typeof import('../shared/lib/utils/warn-once')
       const origSrc = new URL(src, 'http://n').searchParams.get('url') || src
       if (img.getAttribute('data-nimg') === 'fill') {
-        if (
-          !unoptimized &&
-          (!img.getAttribute('sizes') || img.getAttribute('sizes') === '100vw')
-        ) {
+        if (!unoptimized && (!sizesInput || sizesInput === '100vw')) {
           let widthViewportRatio =
             img.getBoundingClientRect().width / window.innerWidth
           if (widthViewportRatio < 0.6) {
-            warnOnce(
-              `Image with src "${origSrc}" has "fill" but is missing "sizes" prop. Please add it to improve page performance. Read more: https://nextjs.org/docs/api-reference/next/image#sizes`
-            )
+            if (sizesInput === '100vw') {
+              warnOnce(
+                `Image with src "${origSrc}" has "fill" prop and "sizes" prop of "100vw", but image is not rendered at full viewport width. Please adjust "sizes" to improve page performance. Read more: https://nextjs.org/docs/api-reference/next/image#sizes`
+              )
+            } else {
+              warnOnce(
+                `Image with src "${origSrc}" has "fill" but is missing "sizes" prop. Please add it to improve page performance. Read more: https://nextjs.org/docs/api-reference/next/image#sizes`
+              )
+            }
           }
         }
         if (img.parentElement) {
@@ -145,16 +144,31 @@ function handleLoading(
         }
       }
 
-      const heightModified =
-        img.height.toString() !== img.getAttribute('height')
-      const widthModified = img.width.toString() !== img.getAttribute('width')
+      // Compare the rendered box with the image's intrinsic proportions. The
+      // width and height props alone cannot tell a cropped or rounded image
+      // from a distorted one.
+      const { width, height, naturalWidth, naturalHeight } = img
       if (
-        (heightModified && !widthModified) ||
-        (!heightModified && widthModified)
+        img.getAttribute('data-nimg') !== 'fill' &&
+        width > 0 &&
+        height > 0 &&
+        naturalWidth > 0 &&
+        naturalHeight > 0 &&
+        // Other object-fit values crop or letterbox instead of distorting.
+        window.getComputedStyle(img).objectFit === 'fill'
       ) {
-        warnOnce(
-          `Image with src "${origSrc}" has either width or height modified, but not the other. If you use CSS to change the size of your image, also include the styles 'width: "auto"' or 'height: "auto"' to maintain the aspect ratio.`
-        )
+        const renderedRatio = width / height
+        const intrinsicRatio = naturalWidth / naturalHeight
+        // Rendered dimensions are rounded to whole pixels and natural
+        // dimensions are truncated after density correction, so allow for
+        // that much error in each dimension.
+        const tolerance =
+          0.5 / width + 0.5 / height + 1 / naturalWidth + 1 / naturalHeight
+        if (Math.abs(renderedRatio / intrinsicRatio - 1) > tolerance) {
+          warnOnce(
+            `Image with src "${origSrc}" is rendered with a different aspect ratio than its intrinsic dimensions. Adjust the width and height props, or use CSS 'width: "auto"' or 'height: "auto"' to preserve the aspect ratio. Read more: https://nextjs.org/docs/app/api-reference/components/image#style`
+          )
+        }
       }
     }
   })
@@ -163,11 +177,8 @@ function handleLoading(
 function getDynamicProps(
   fetchPriority?: string
 ): Record<string, string | undefined> {
-  const [majorStr, minorStr] = version.split('.', 2)
-  const major = parseInt(majorStr, 10)
-  const minor = parseInt(minorStr, 10)
-  if (major > 18 || (major === 18 && minor >= 3)) {
-    // In React 18.3.0 or newer, we must use camelCase
+  if (Boolean(use)) {
+    // In React 19.0.0 or newer, we must use camelCase
     // prop to avoid "Warning: Invalid DOM property".
     // See https://github.com/facebook/react/pull/25927
     return { fetchPriority }
@@ -176,6 +187,15 @@ function getDynamicProps(
   // to avoid "Warning: Invalid DOM property".
   return { fetchpriority: fetchPriority }
 }
+
+/**
+ * A version of useLayoutEffect that doesn't warn during SSR.
+ * TODO: Just useLayoutEffect once support for React 18 is dropped.
+ * Do not rename this to "isomorphic layout effect". There is no such thing as
+ * an isomorphic Layout Effect since there is no Layout on the server
+ */
+const useNonWarningLayoutEffect =
+  typeof window === 'undefined' ? useEffect : useLayoutEffect
 
 const ImageElement = forwardRef<HTMLImageElement | null, ImageElementProps>(
   (
@@ -197,13 +217,71 @@ const ImageElement = forwardRef<HTMLImageElement | null, ImageElementProps>(
       onLoadingCompleteRef,
       setBlurComplete,
       setShowAltText,
+      sizesInput,
       onLoad,
       onError,
       ...rest
     },
     forwardedRef
   ) => {
+    const didInsertRef = useRef(false)
+    const insertedImgRef = useRef<HTMLImageElement>(null)
+
+    useNonWarningLayoutEffect(() => {
+      const { current: didInsert } = didInsertRef
+      const { current: img } = insertedImgRef
+
+      if (!didInsert && img !== null) {
+        // Replay events from during hydration that React doesn't replay.
+        if (onError) {
+          // If the image has an error before react hydrates, then the error is lost.
+          // The workaround is to wait until the image is mounted which is after hydration,
+          // then we set the src again to trigger the error handler (if there was an error).
+          // This doesn't just trigger the error handler but retries the whole request.
+          // TODO: Consider dispatching a synthetic event instead.
+          // eslint-disable-next-line no-self-assign
+          img.src = img.src
+        }
+
+        if (process.env.NODE_ENV !== 'production') {
+          if (!src) {
+            console.error(`Image is missing required "src" property:`, img)
+          }
+          if (img.getAttribute('alt') === null) {
+            console.error(
+              `Image is missing required "alt" property. Please add Alternative Text to describe the image for screen readers and search engines.`
+            )
+          }
+        }
+        if (img.complete) {
+          handleLoading(
+            img,
+            placeholder,
+            onLoadRef,
+            onLoadingCompleteRef,
+            setBlurComplete,
+            unoptimized,
+            sizesInput
+          )
+        }
+        didInsertRef.current = true
+      }
+    }, [
+      src,
+      placeholder,
+      onLoadRef,
+      onLoadingCompleteRef,
+      onError,
+      unoptimized,
+      sizesInput,
+    ])
+
+    const ref = useMergedRef(forwardedRef, insertedImgRef)
+
     return (
+      // If you move this element creation, also move the Layout Effect above
+      // reading from the ref. Otherwise we might run the Layout Effect when
+      // the current value isn't set to the HTMLImageElement instance.
       <img
         {...rest}
         {...getDynamicProps(fetchPriority)}
@@ -226,66 +304,17 @@ const ImageElement = forwardRef<HTMLImageElement | null, ImageElementProps>(
         sizes={sizes}
         srcSet={srcSet}
         src={src}
-        ref={useCallback(
-          (img: ImgElementWithDataProp | null) => {
-            if (forwardedRef) {
-              if (typeof forwardedRef === 'function') forwardedRef(img)
-              else if (typeof forwardedRef === 'object') {
-                // @ts-ignore - .current is read only it's usually assigned by react internally
-                forwardedRef.current = img
-              }
-            }
-            if (!img) {
-              return
-            }
-            if (onError) {
-              // If the image has an error before react hydrates, then the error is lost.
-              // The workaround is to wait until the image is mounted which is after hydration,
-              // then we set the src again to trigger the error handler (if there was an error).
-              // eslint-disable-next-line no-self-assign
-              img.src = img.src
-            }
-            if (process.env.NODE_ENV !== 'production') {
-              if (!src) {
-                console.error(`Image is missing required "src" property:`, img)
-              }
-              if (img.getAttribute('alt') === null) {
-                console.error(
-                  `Image is missing required "alt" property. Please add Alternative Text to describe the image for screen readers and search engines.`
-                )
-              }
-            }
-            if (img.complete) {
-              handleLoading(
-                img,
-                placeholder,
-                onLoadRef,
-                onLoadingCompleteRef,
-                setBlurComplete,
-                unoptimized
-              )
-            }
-          },
-          [
-            src,
-            placeholder,
-            onLoadRef,
-            onLoadingCompleteRef,
-            setBlurComplete,
-            onError,
-            unoptimized,
-            forwardedRef,
-          ]
-        )}
+        ref={ref}
         onLoad={(event) => {
-          const img = event.currentTarget as ImgElementWithDataProp
+          const currentImage = event.currentTarget
           handleLoading(
-            img,
+            currentImage,
             placeholder,
             onLoadRef,
             onLoadingCompleteRef,
             setBlurComplete,
-            unoptimized
+            unoptimized,
+            sizesInput
           )
         }}
         onError={(event) => {
@@ -311,7 +340,7 @@ function ImagePreload({
   isAppRouter: boolean
   imgAttributes: ImgProps
 }) {
-  const opts = {
+  const opts: ReactDOM.PreloadOptions = {
     as: 'image',
     imageSrcSet: imgAttributes.srcSet,
     imageSizes: imgAttributes.sizes,
@@ -321,12 +350,7 @@ function ImagePreload({
   }
 
   if (isAppRouter && ReactDOM.preload) {
-    // See https://github.com/facebook/react/pull/26940
-    ReactDOM.preload(
-      imgAttributes.src,
-      // @ts-expect-error TODO: upgrade to `@types/react-dom@18.3.x`
-      opts
-    )
+    ReactDOM.preload(imgAttributes.src, opts)
     return null
   }
 
@@ -352,19 +376,18 @@ function ImagePreload({
   )
 }
 
+/**
+ * The `Image` component is used to optimize images.
+ *
+ * Read more: [Next.js docs: `Image`](https://nextjs.org/docs/app/api-reference/components/image)
+ */
 export const Image = forwardRef<HTMLImageElement | null, ImageProps>(
   (props, forwardedRef) => {
     const pagesRouter = useContext(RouterContext)
     // We're in the app directory if there is no pages router.
     const isAppRouter = !pagesRouter
 
-    const configContext = useContext(ImageConfigContext)
-    const config = useMemo(() => {
-      const c = configEnv || configContext || imageConfigDefault
-      const allSizes = [...c.deviceSizes, ...c.imageSizes].sort((a, b) => a - b)
-      const deviceSizes = c.deviceSizes.sort((a, b) => a - b)
-      return { ...c, allSizes, deviceSizes }
-    }, [configContext])
+    const config = useImageConfig()
 
     const { onLoad, onLoadingComplete } = props
     const onLoadRef = useRef(onLoad)
@@ -381,7 +404,6 @@ export const Image = forwardRef<HTMLImageElement | null, ImageProps>(
 
     const [blurComplete, setBlurComplete] = useState(false)
     const [showAltText, setShowAltText] = useState(false)
-
     const { props: imgAttributes, meta: imgMeta } = getImgProps(props, {
       defaultLoader,
       imgConf: config,
@@ -401,10 +423,11 @@ export const Image = forwardRef<HTMLImageElement | null, ImageProps>(
             onLoadingCompleteRef={onLoadingCompleteRef}
             setBlurComplete={setBlurComplete}
             setShowAltText={setShowAltText}
+            sizesInput={props.sizes}
             ref={forwardedRef}
           />
         }
-        {imgMeta.priority ? (
+        {imgMeta.preload ? (
           <ImagePreload
             isAppRouter={isAppRouter}
             imgAttributes={imgAttributes}

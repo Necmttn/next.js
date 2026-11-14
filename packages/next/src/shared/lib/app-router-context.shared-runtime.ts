@@ -1,107 +1,49 @@
 'use client'
 
-import type {
-  FocusAndScrollRef,
-  PrefetchKind,
-} from '../../client/components/router-reducer/router-reducer-types'
-import type { FetchServerResponseResult } from '../../client/components/router-reducer/fetch-server-response'
+import type { RouteTree } from '../../client/components/segment-cache/cache'
+
+import type { ScrollHandlerRef } from '../../client/components/router-reducer/router-reducer-types'
+import type { Params } from '../../server/request/params'
 import type {
   FlightRouterState,
-  FlightData,
-} from '../../server/app-render/types'
+  FlightSegmentPath,
+  CacheNode,
+  LoadingModuleData,
+} from './app-router-types'
 import React from 'react'
-
-export type ChildSegmentMap = Map<string, CacheNode>
-
-/**
- * Cache node used in app-router / layout-router.
- */
-export type CacheNode = ReadyCacheNode | LazyCacheNode
-
-export type LazyCacheNode = {
-  /**
-   * When rsc is null, this is a lazily-initialized cache node.
-   *
-   * If the app attempts to render it, it triggers a lazy data fetch,
-   * postpones the render, and schedules an update to a new tree.
-   *
-   * TODO: This mechanism should not be used when PPR is enabled, though it
-   * currently is in some cases until we've implemented partial
-   * segment fetching.
-   */
-  rsc: null
-
-  /**
-   * A prefetched version of the segment data. See explanation in corresponding
-   * field of ReadyCacheNode (below).
-   *
-   * Since LazyCacheNode mostly only exists in the non-PPR implementation, this
-   * will usually be null, but it could have been cloned from a previous
-   * CacheNode that was created by the PPR implementation. Eventually we want
-   * to migrate everything away from LazyCacheNode entirely.
-   */
-  prefetchRsc: React.ReactNode
-
-  /**
-   * A pending response for the lazy data fetch. If this is not present
-   * during render, it is lazily created.
-   */
-  lazyData: Promise<FetchServerResponseResult> | null
-
-  // TODO: We should make both of these non-optional. Most of the places that
-  // clone the Cache Nodes do not preserve this field. In practice this ends up
-  // working out because we only clone nodes when we're receiving a new head,
-  // anyway. But it's fragile. It also breaks monomorphization.
-  prefetchHead?: React.ReactNode
-  head?: React.ReactNode
-  /**
-   * Child parallel routes.
-   */
-  parallelRoutes: Map<string, ChildSegmentMap>
-}
-
-export type ReadyCacheNode = {
-  /**
-   * When rsc is not null, it represents the RSC data for the
-   * corresponding segment.
-   *
-   * `null` is a valid React Node but because segment data is always a
-   * <LayoutRouter> component, we can use `null` to represent empty.
-   *
-   * TODO: For additional type safety, update this type to
-   * Exclude<React.ReactNode, null>. Need to update createEmptyCacheNode to
-   * accept rsc as an argument, or just inline the callers.
-   */
-  rsc: React.ReactNode
-
-  /**
-   * Represents a static version of the segment that can be shown immediately,
-   * and may or may not contain dynamic holes. It's prefetched before a
-   * navigation occurs.
-   *
-   * During rendering, we will choose whether to render `rsc` or `prefetchRsc`
-   * with `useDeferredValue`. As with the `rsc` field, a value of `null` means
-   * no value was provided. In this case, the LayoutRouter will go straight to
-   * rendering the `rsc` value; if that one is also missing, it will suspend and
-   * trigger a lazy fetch.
-   */
-  prefetchRsc: React.ReactNode
-
-  /**
-   * There should never be a lazy data request in this case.
-   */
-  lazyData: null
-  prefetchHead?: React.ReactNode
-  head?: React.ReactNode
-  parallelRoutes: Map<string, ChildSegmentMap>
-}
 
 export interface NavigateOptions {
   scroll?: boolean
+  /**
+   * Transition types to apply when navigating. These types are passed to
+   * [`React.addTransitionType`](https://react.dev/reference/react/addTransitionType)
+   * inside the navigation transition, enabling
+   * [`<ViewTransition>`](https://react.dev/reference/react/ViewTransition) components
+   * to apply different animations based on the type of navigation.
+   */
+  transitionTypes?: string[]
+}
+
+/**
+ * A navigation started by `router.experimental_prepare()`. Call `push` or
+ * `replace` to commit it. A prepared navigation can only be committed once;
+ * later calls have no effect.
+ * @experimental
+ */
+export interface PreparedNavigation {
+  /**
+   * Commit the navigation, pushing a new history entry.
+   */
+  push(options?: NavigateOptions): void
+  /**
+   * Commit the navigation, replacing the current history entry.
+   */
+  replace(options?: NavigateOptions): void
 }
 
 export interface PrefetchOptions {
-  kind: PrefetchKind
+  kind?: 'auto' | 'full' | 'shell' | 'prefetch' | 'navigation'
+  onInvalidate?: () => void
 }
 
 export interface AppRouterInstance {
@@ -118,6 +60,11 @@ export interface AppRouterInstance {
    */
   refresh(): void
   /**
+   * Refresh the current page. Use in development only.
+   * @internal
+   */
+  hmrRefresh(): void
+  /**
    * Navigate to the provided href.
    * Pushes a new history entry.
    */
@@ -131,29 +78,72 @@ export interface AppRouterInstance {
    * Prefetch the provided href.
    */
   prefetch(href: string, options?: PrefetchOptions): void
+  /**
+   * Perform a gesture navigation using prefetched data.
+   * Only available when experimental.gestureTransition is enabled.
+   * @experimental
+   */
+  experimental_gesturePush?(href: string, options?: NavigateOptions): void
+  /**
+   * Start a navigation without committing it. The navigation's data is
+   * requested immediately; calling `push` or `replace` on the result commits
+   * the navigation, reusing that data. For example, prepare on `pointerdown`
+   * and commit on `click`.
+   *
+   * Unlike `prefetch`, this issues the full dynamic request for the route, the
+   * same as a regular navigation.
+   *
+   * If the navigation is never committed, its data remains in the router's
+   * back/forward cache, where a back/forward navigation to an overlapping
+   * route may display it.
+   *
+   * Only available when experimental.prepareNavigation is enabled.
+   * @experimental
+   */
+  experimental_prepare?(href: string): PreparedNavigation
+  /**
+   * An opaque string identifier scoped to the current route segment.
+   *
+   * Changes when the surrounding segment is freshly created by a push or
+   * replace navigation. Stays the same for back/forward navigations,
+   * `router.refresh()`, and search-param/hash-only changes.
+   *
+   * Intended to be passed to a React `key` to opt out of state preservation
+   * on fresh navigations:
+   *
+   * ```tsx
+   * <form key={useRouter().bfcacheId}>
+   * ```
+   *
+   * In most cases, prefer resetting state explicitly in an event handler, or
+   * deriving a key from your data (e.g. a draft id from the server). Use
+   * `bfcacheId` only when those patterns aren't a fit.
+   */
+  bfcacheId: string
 }
 
 export const AppRouterContext = React.createContext<AppRouterInstance | null>(
   null
 )
 export const LayoutRouterContext = React.createContext<{
-  childNodes: CacheNode['parallelRoutes']
-  tree: FlightRouterState
+  parentTree: FlightRouterState
+  parentRenderTree: RouteTree<CacheNode>
+  parentSegmentPath: FlightSegmentPath | null
+  parentParams: Params
+  parentLoadingData: LoadingModuleData | null
+  debugNameContext: string
   url: string
-}>(null as any)
+  isActive: boolean
+} | null>(null)
+
 export const GlobalLayoutRouterContext = React.createContext<{
-  buildId: string
   tree: FlightRouterState
-  changeByServerResponse: (
-    previousTree: FlightRouterState,
-    flightData: FlightData,
-    overrideCanonicalUrl: URL | undefined
-  ) => void
-  focusAndScrollRef: FocusAndScrollRef
+  scrollRef: ScrollHandlerRef
   nextUrl: string | null
+  previousNextUrl: string | null
 }>(null as any)
 
-export const TemplateContext = React.createContext<React.ReactNode>(null as any)
+export const TemplateContext = React.createContext<React.ReactNode>(null)
 
 if (process.env.NODE_ENV !== 'production') {
   AppRouterContext.displayName = 'AppRouterContext'

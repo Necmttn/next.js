@@ -1,58 +1,125 @@
+// eslint-disable-next-line import/no-extraneous-dependencies
 export {
+  createTemporaryReferenceSet,
   renderToReadableStream,
   decodeReply,
   decodeAction,
   decodeFormState,
-  // eslint-disable-next-line import/no-extraneous-dependencies
-} from 'react-server-dom-webpack/server.edge'
+} from 'react-server-dom-webpack/server'
 
-import AppRouter from '../../client/components/app-router'
-import LayoutRouter from '../../client/components/layout-router'
-import RenderFromTemplateContext from '../../client/components/render-from-template-context'
-import { staticGenerationAsyncStorage } from '../../client/components/static-generation-async-storage.external'
-import { requestAsyncStorage } from '../../client/components/request-async-storage.external'
-import { actionAsyncStorage } from '../../client/components/action-async-storage.external'
-import { ClientPageRoot } from '../../client/components/client-page'
-import {
-  createUntrackedSearchParams,
-  createDynamicallyTrackedSearchParams,
-} from '../../client/components/search-params'
-import * as serverHooks from '../../client/components/hooks-server-context'
-import { NotFoundBoundary } from '../../client/components/not-found-boundary'
-import { patchFetch as _patchFetch } from '../lib/patch-fetch'
-// not being used but needs to be included in the client manifest for /_not-found
-import '../../client/components/error-boundary'
+// eslint-disable-next-line import/no-extraneous-dependencies
+export { prerender } from 'react-server-dom-webpack/static'
 
-import {
-  preloadStyle,
-  preloadFont,
-  preconnect,
-} from '../../server/app-render/rsc/preloads'
-import { Postpone } from '../../server/app-render/rsc/postpone'
-import { taintObjectReference } from '../../server/app-render/rsc/taint'
-
-// patchFetch makes use of APIs such as `React.unstable_postpone` which are only available
-// in the experimental channel of React, so export it from here so that it comes from the bundled runtime
-function patchFetch() {
-  return _patchFetch({ serverHooks, staticGenerationAsyncStorage })
+// Node.js-specific Flight APIs, needed by stream-ops.node.ts via ComponentMod.
+// These must be exported from entry-base (react-server layer) because direct
+// imports from react-server-dom-webpack/* fail outside this layer.
+type FlightRenderToPipeableStream = (...args: any[]) => {
+  pipe<Writable extends NodeJS.WritableStream>(destination: Writable): Writable
+  abort: (reason?: unknown) => void
 }
+
+type FlightPrerenderToNodeStream = (...args: any[]) => Promise<{
+  prelude: import('node:stream').Readable
+}>
+
+/* eslint-disable import/no-extraneous-dependencies */
+export let renderToPipeableStream: FlightRenderToPipeableStream | undefined
+export let prerenderToNodeStream: FlightPrerenderToNodeStream | undefined
+if (process.env.__NEXT_USE_NODE_STREAMS) {
+  renderToPipeableStream = (
+    require('react-server-dom-webpack/server.node') as typeof import('react-server-dom-webpack/server.node')
+  ).renderToPipeableStream
+  prerenderToNodeStream = (
+    require('react-server-dom-webpack/static') as typeof import('react-server-dom-webpack/static')
+  ).prerenderToNodeStream
+} else {
+  renderToPipeableStream = undefined
+  prerenderToNodeStream = undefined
+}
+/* eslint-enable import/no-extraneous-dependencies */
+
+// TODO: Just re-export `* as ReactServer`
+export { captureOwnerStack, createElement, Fragment } from 'react'
 
 export {
-  AppRouter,
-  LayoutRouter,
-  RenderFromTemplateContext,
-  staticGenerationAsyncStorage,
-  requestAsyncStorage,
-  actionAsyncStorage,
-  createUntrackedSearchParams,
-  createDynamicallyTrackedSearchParams,
-  serverHooks,
-  preloadStyle,
-  preloadFont,
-  preconnect,
-  Postpone,
-  taintObjectReference,
-  ClientPageRoot,
-  NotFoundBoundary,
-  patchFetch,
+  default as LayoutRouter,
+  LoadingBoundaryProvider,
+} from '../../client/components/layout-router'
+export { default as RenderFromTemplateContext } from '../../client/components/render-from-template-context'
+export { ClientPageRoot } from '../../client/components/client-page'
+export { ClientSegmentRoot } from '../../client/components/client-segment'
+export {
+  createServerSearchParamsForServerPage,
+  createPrerenderSearchParamsForClientPage,
+} from '../request/search-params'
+export {
+  createServerParamsForServerSegment,
+  createPrerenderParamsForClientSegment,
+} from '../request/params'
+export * as serverHooks from '../../client/components/hooks-server-context'
+export { HTTPAccessFallbackBoundary } from '../../client/components/http-access-fallback/error-boundary'
+export { createMetadataComponents } from '../../lib/metadata'
+export { RootLayoutBoundary } from '../../lib/framework/boundary-components'
+
+export { preloadStyle, preloadFont, preconnect } from './rsc/preloads'
+export { isEmptyHTMLPrelude } from './postponed-state'
+export { taintObjectReference } from './rsc/taint'
+export {
+  collectSegmentData,
+  collectPrefetchHints,
+} from './collect-segment-data'
+
+export const InstantValidation = () => {
+  if (
+    process.env.NEXT_RUNTIME !== 'edge' &&
+    process.env.__NEXT_CACHE_COMPONENTS
+  ) {
+    return require('./instant-validation/instant-validation') as typeof import('./instant-validation/instant-validation')
+  } else {
+    return undefined
+  }
 }
+
+import type { NodeJsPartialHmrUpdate } from '../../build/swc/types'
+import { workAsyncStorage } from '../app-render/work-async-storage.external'
+import { workUnitAsyncStorage } from './work-unit-async-storage.external'
+import { patchFetch as _patchFetch } from '../lib/patch-fetch'
+
+let SegmentViewNode: typeof import('../../next-devtools/userspace/app/segment-explorer-node').SegmentViewNode =
+  () => null
+let SegmentViewStateNode: typeof import('../../next-devtools/userspace/app/segment-explorer-node').SegmentViewStateNode =
+  () => null
+if (process.env.NODE_ENV === 'development') {
+  const mod =
+    require('../../next-devtools/userspace/app/segment-explorer-node') as typeof import('../../next-devtools/userspace/app/segment-explorer-node')
+  SegmentViewNode = mod.SegmentViewNode
+  SegmentViewStateNode = mod.SegmentViewStateNode
+}
+
+// For hot-reloader
+declare global {
+  var __next__clear_chunk_cache__: (() => void) | null | undefined
+  var __turbopack_clear_chunk_cache__: () => void | null | undefined
+  var __turbopack_server_hmr_apply__:
+    | ((update: NodeJsPartialHmrUpdate) => void)
+    | undefined
+}
+
+// hot-reloader modules are not bundled so we need to inject `__next__clear_chunk_cache__`
+// into globalThis from this file which is bundled.
+if (process.env.TURBOPACK) {
+  globalThis.__next__clear_chunk_cache__ = __turbopack_clear_chunk_cache__
+} else {
+  // Webpack does not have chunks on the server
+  globalThis.__next__clear_chunk_cache__ = null
+}
+
+export function patchFetch() {
+  return _patchFetch({
+    workAsyncStorage,
+    workUnitAsyncStorage,
+  })
+}
+
+// Development only
+export { SegmentViewNode, SegmentViewStateNode }

@@ -1,33 +1,26 @@
 'use client'
 
-import React from 'react'
-import { usePathname } from './navigation'
+import React, { startTransition, type JSX } from 'react'
+import { useUntrackedPathname } from './navigation-untracked'
 import { isNextRouterError } from './is-next-router-error'
+import { handleHardNavError } from './nav-failure-handler'
+import { handleISRError } from './handle-isr-error'
+import { isBot } from '../../shared/lib/router/utils/is-bot'
+import {
+  AppRouterContext,
+  type AppRouterInstance,
+} from '../../shared/lib/app-router-context.shared-runtime'
 
-const styles = {
-  error: {
-    // https://github.com/sindresorhus/modern-normalize/blob/main/modern-normalize.css#L38-L52
-    fontFamily:
-      'system-ui,"Segoe UI",Roboto,Helvetica,Arial,sans-serif,"Apple Color Emoji","Segoe UI Emoji"',
-    height: '100vh',
-    textAlign: 'center',
-    display: 'flex',
-    flexDirection: 'column',
-    alignItems: 'center',
-    justifyContent: 'center',
-  },
-  text: {
-    fontSize: '14px',
-    fontWeight: 400,
-    lineHeight: '28px',
-    margin: '0 8px',
-  },
-} as const
+const isBotUserAgent =
+  typeof window !== 'undefined' && isBot(window.navigator.userAgent)
 
-export type ErrorComponent = React.ComponentType<{
-  error: Error
+export type ErrorInfo = {
+  error: unknown
   reset: () => void
-}>
+  retry: () => void
+}
+
+export type ErrorComponent = React.ComponentType<ErrorInfo>
 
 export interface ErrorBoundaryProps {
   children?: React.ReactNode
@@ -37,56 +30,62 @@ export interface ErrorBoundaryProps {
 }
 
 interface ErrorBoundaryHandlerProps extends ErrorBoundaryProps {
-  pathname: string
+  pathname: string | null
   errorComponent: ErrorComponent
 }
 
 interface ErrorBoundaryHandlerState {
-  error: Error | null
-  previousPathname: string
-}
-
-// if we are revalidating we want to re-throw the error so the
-// function crashes so we can maintain our previous cache
-// instead of caching the error page
-function HandleISRError({ error }: { error: any }) {
-  if (typeof (fetch as any).__nextGetStaticStore === 'function') {
-    const store:
-      | undefined
-      | import('./static-generation-async-storage.external').StaticGenerationStore =
-      (fetch as any).__nextGetStaticStore()?.getStore()
-
-    if (store?.isRevalidate || store?.isStaticGeneration) {
-      console.error(error)
-      throw error
-    }
-  }
-  return null
+  error: null | { thrownValue: unknown }
+  previousPathname: string | null
 }
 
 export class ErrorBoundaryHandler extends React.Component<
   ErrorBoundaryHandlerProps,
   ErrorBoundaryHandlerState
 > {
+  static contextType = AppRouterContext
+  declare context: AppRouterInstance | null
+
   constructor(props: ErrorBoundaryHandlerProps) {
     super(props)
-    this.state = { error: null, previousPathname: this.props.pathname }
+    this.state = {
+      error: null,
+      previousPathname: this.props.pathname,
+    }
   }
 
-  static getDerivedStateFromError(error: Error) {
-    if (isNextRouterError(error)) {
+  static getDerivedStateFromError(
+    thrownValue: unknown
+  ): Partial<ErrorBoundaryHandlerState> {
+    if (isNextRouterError(thrownValue)) {
       // Re-throw if an expected internal Next.js router error occurs
       // this means it should be handled by a different boundary (such as a NotFound boundary in a parent segment)
-      throw error
+      throw thrownValue
     }
 
-    return { error }
+    return { error: { thrownValue } }
   }
 
   static getDerivedStateFromProps(
     props: ErrorBoundaryHandlerProps,
     state: ErrorBoundaryHandlerState
   ): ErrorBoundaryHandlerState | null {
+    const { error } = state
+
+    // if we encounter an error while
+    // a navigation is pending we shouldn't render
+    // the error boundary and instead should fallback
+    // to a hard navigation to attempt recovering
+    if (process.env.__NEXT_APP_NAV_FAIL_HANDLING) {
+      if (error && handleHardNavError(error.thrownValue)) {
+        // clear error so we don't render anything
+        return {
+          error: null,
+          previousPathname: props.pathname,
+        }
+      }
+    }
+
     /**
      * Handles reset of the error boundary when a navigation happens.
      * Ensures the error boundary does not stay enabled when navigating to a new page.
@@ -109,16 +108,30 @@ export class ErrorBoundaryHandler extends React.Component<
     this.setState({ error: null })
   }
 
-  render() {
-    if (this.state.error) {
+  retry = () => {
+    startTransition(() => {
+      this.context?.refresh()
+      this.reset()
+    })
+  }
+
+  // Explicit type is needed to avoid the generated `.d.ts` having a wide return type that could be specific to the `@types/react` version.
+  render(): React.ReactNode {
+    //When it's bot request, segment level error boundary will keep rendering the children,
+    // the final error will be caught by the root error boundary and determine wether need to apply graceful degrade.
+    if (this.state.error && !isBotUserAgent) {
+      const thrownValue = this.state.error.thrownValue
+      handleISRError({ error: thrownValue })
+
       return (
         <>
-          <HandleISRError error={this.state.error} />
           {this.props.errorStyles}
           {this.props.errorScripts}
           <this.props.errorComponent
-            error={this.state.error}
+            // TODO(NAR-804): Docs say this is an Error object, but we don't guarantee that
+            error={thrownValue}
             reset={this.reset}
+            retry={this.retry}
           />
         </>
       )
@@ -127,34 +140,6 @@ export class ErrorBoundaryHandler extends React.Component<
     return this.props.children
   }
 }
-
-export function GlobalError({ error }: { error: any }) {
-  const digest: string | undefined = error?.digest
-  return (
-    <html id="__next_error__">
-      <head></head>
-      <body>
-        <HandleISRError error={error} />
-        <div style={styles.error}>
-          <div>
-            <h2 style={styles.text}>
-              {`Application error: a ${
-                digest ? 'server' : 'client'
-              }-side exception has occurred (see the ${
-                digest ? 'server logs' : 'browser console'
-              } for more information).`}
-            </h2>
-            {digest ? <p style={styles.text}>{`Digest: ${digest}`}</p> : null}
-          </div>
-        </div>
-      </body>
-    </html>
-  )
-}
-
-// Exported so that the import signature in the loaders can be identical to user
-// supplied custom global error signatures.
-export default GlobalError
 
 /**
  * Handles errors through `getDerivedStateFromError`.
@@ -170,8 +155,15 @@ export function ErrorBoundary({
   errorStyles,
   errorScripts,
   children,
-}: ErrorBoundaryProps & { children: React.ReactNode }): JSX.Element {
-  const pathname = usePathname()
+}: ErrorBoundaryProps & {
+  children: React.ReactNode
+}): JSX.Element {
+  // When we're rendering the missing params shell, this will return null. This
+  // is because we won't be rendering any not found boundaries or error
+  // boundaries for the missing params shell. When this runs on the client
+  // (where these errors can occur), we will get the correct pathname.
+  const pathname = useUntrackedPathname()
+
   if (errorComponent) {
     return (
       <ErrorBoundaryHandler

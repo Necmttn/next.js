@@ -1,10 +1,12 @@
 /* eslint-disable import/no-extraneous-dependencies */
+import { lstatSync, readdirSync } from 'node:fs'
+import { join } from 'node:path'
 import { green, blue } from 'picocolors'
-import fs from 'fs'
-import path from 'path'
 
 export function isFolderEmpty(root: string, name: string): boolean {
-  const validFiles = [
+  const validFilesOrFolders = [
+    '.claude',
+    '.cursor',
     '.DS_Store',
     '.git',
     '.gitattributes',
@@ -16,6 +18,8 @@ export function isFolderEmpty(root: string, name: string): boolean {
     '.idea',
     '.npmignore',
     '.travis.yml',
+    '.vscode',
+    '.zed',
     'LICENSE',
     'Thumbs.db',
     'docs',
@@ -27,11 +31,11 @@ export function isFolderEmpty(root: string, name: string): boolean {
     '.yarn',
   ]
 
-  const conflicts = fs.readdirSync(root).filter(
-    (file) =>
-      !validFiles.includes(file) &&
+  const conflicts = readdirSync(root).filter(
+    (fileOrFolder) =>
+      !validFilesOrFolders.includes(fileOrFolder) &&
       // Support IntelliJ IDEA-based editors
-      !/\.iml$/.test(file)
+      !/\.iml$/.test(fileOrFolder)
   )
 
   if (conflicts.length > 0) {
@@ -41,7 +45,7 @@ export function isFolderEmpty(root: string, name: string): boolean {
     console.log()
     for (const file of conflicts) {
       try {
-        const stats = fs.lstatSync(path.join(root, file))
+        const stats = lstatSync(join(root, file))
         if (stats.isDirectory()) {
           console.log(`  ${blue(file)}/`)
         } else {
